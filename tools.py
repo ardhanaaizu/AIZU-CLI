@@ -67,26 +67,67 @@ def list_dir(path: str = ".") -> str:
         return f"ERROR membaca direktori: {e}"
 
 
-def run_shell(command: str) -> str:
-    """Jalankan perintah shell di Termux dan kembalikan output-nya."""
+def run_shell(command: str, timeout: int = 300) -> str:
+    """Jalankan perintah shell di Termux dan kembalikan output-nya.
+
+    Timeout default 300 detik (5 menit) untuk perintah panjang seperti install.
+    Perintah install (apt, pkg, npm, pip) otomatis dapat timeout lebih lama.
+    """
     low = command.lower()
     for bad in DANGEROUS:
         if bad in low:
             return f"DITOLAK: perintah berbahaya terdeteksi ('{bad}')."
+
+    # Deteksi perintah install/package manager - timeout lebih lama
+    install_patterns = [
+        "apt install", "apt update", "apt upgrade",
+        "pkg install", "pkg update", "pkg upgrade",
+        "npm install", "yarn install", "pnpm install",
+        "pip install", "pip3 install",
+        "brew install", "brew update",
+        "cargo install",
+        "git clone",
+        "curl", "wget",
+    ]
+    is_long_running = any(pattern in low for pattern in install_patterns)
+
+    # Timeout lebih lama untuk perintah install
+    actual_timeout = 600 if is_long_running else timeout  # 10 menit untuk install
+
     try:
-        result = subprocess.run(
+        # Jalankan dengan subprocess.Popen untuk kontrol lebih baik
+        process = subprocess.Popen(
             command,
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=60,
         )
-        out = (result.stdout or "") + (result.stderr or "")
+
+        try:
+            stdout, stderr = process.communicate(timeout=actual_timeout)
+        except subprocess.TimeoutExpired:
+            # Timeout - beri info ke user
+            process.kill()
+            process.wait()
+            if is_long_running:
+                return (
+                    f"⏳ Perintah masih berjalan (timeout {actual_timeout}s).\n"
+                    f"Perintah: {command[:100]}\n"
+                    f"Tip: Jalankan perintah ini di terminal terpisah untuk hasil optimal."
+                )
+            else:
+                return f"ERROR: perintah melebihi batas waktu {actual_timeout} detik."
+
+        out = (stdout or "") + (stderr or "")
         if len(out) > 10000:
             out = out[:10000] + "\n... (terpotong)"
-        return out.strip() or f"(selesai, kode keluar {result.returncode})"
-    except subprocess.TimeoutExpired:
-        return "ERROR: perintah melebihi batas waktu 60 detik."
+
+        if process.returncode != 0:
+            return out.strip() or f"(selesai dengan error, kode keluar {process.returncode})"
+
+        return out.strip() or f"(selesai, kode keluar {process.returncode})"
+
     except Exception as e:
         return f"ERROR menjalankan perintah: {e}"
 
