@@ -255,6 +255,69 @@ def build_system_prompt(mode):
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
+# Context management settings
+MAX_CONTEXT_MESSAGES = 20  # Maksimal pesan yang dikirim ke API
+CACHE_SUMMARY_TOKENS = 100  # Estimasi token untuk summary percakapan lama
+
+
+def compress_messages(messages, max_messages=MAX_CONTEXT_MESSAGES):
+    """Kompresi pesan untuk hemat token.
+
+    Strategi:
+    - Simpan system prompt selalu
+    - Simpan 5 pesan terakhir (recent context)
+    - Pesan lama di-summary jadi satu
+    """
+    if len(messages) <= max_messages:
+        return messages
+
+    # Pisahkan system prompt
+    system_msg = messages[0] if messages[0]["role"] == "system" else None
+    other_msgs = messages[1:] if system_msg else messages
+
+    # Simpan 5 pesan terakhir
+    recent = other_msgs[-5:]
+    old = other_msgs[:-5]
+
+    # Buat summary dari pesan lama
+    if old:
+        summary_parts = []
+        for msg in old:
+            if msg["role"] == "user":
+                content = msg.get("content", "")[:100]
+                summary_parts.append(f"User: {content}")
+            elif msg["role"] == "assistant" and not msg.get("tool_calls"):
+                content = msg.get("content", "")[:100]
+                summary_parts.append(f"Assistant: {content}")
+
+        summary_content = "Ringkasan percakapan sebelumnya:\n" + "\n".join(summary_parts[-10:])
+        summary_msg = {"role": "user", "content": summary_content}
+        compressed = [summary_msg] + recent
+    else:
+        compressed = recent
+
+    # Tambah system prompt di awal
+    if system_msg:
+        compressed = [system_msg] + compressed
+
+    return compressed
+
+
+def count_tokens_approx(text):
+    """Estimasi kasar jumlah token (1 token ≈ 4 karakter)."""
+    return len(text) // 4
+
+
+def get_context_info(messages):
+    """Hitung informasi context untuk ditampilkan."""
+    total_chars = sum(len(msg.get("content", "")) for msg in messages)
+    approx_tokens = count_tokens_approx(str(messages))
+    return {
+        "messages": len(messages),
+        "chars": total_chars,
+        "approx_tokens": approx_tokens,
+    }
+
 
 def load_config():
     """Gabungkan config dari file config.json (opsional) dan environment variable.
@@ -769,7 +832,7 @@ def run_tool_calls(tool_calls):
     return results
 
 
-def print_token_usage(usage, total_usage):
+def print_token_usage(usage, total_usage, context_info=None):
     """Tampilkan konsumsi token secara simple."""
     total_tokens = usage.get("total_tokens", 0)
 
@@ -777,7 +840,10 @@ def print_token_usage(usage, total_usage):
     total_usage["total"] += total_tokens
 
     # Tampilkan simple
-    print(f"\033[90m  ✻ {total_tokens} tokens\033[0m")
+    if context_info and context_info.get("compressed"):
+        print(f"\033[90m  ✻ {total_tokens} tokens (cached)\033[0m")
+    else:
+        print(f"\033[90m  ✻ {total_tokens} tokens\033[0m")
 
 
 def chat_loop(cfg):
@@ -823,12 +889,23 @@ def chat_loop(cfg):
 
         messages.append({"role": "user", "content": user})
 
+        # Kompresi pesan untuk hemat token (prompt caching)
+        if len(messages) > MAX_CONTEXT_MESSAGES:
+            compressed = compress_messages(messages)
+            # Tampilkan info kompresi
+            old_count = len(messages)
+            new_count = len(compressed)
+            saved = old_count - new_count
+            print(f"\033[90m  ✻ Context compressed: {old_count} → {new_count} messages (saved {saved})\033[0m")
+        else:
+            compressed = messages
+
         # Loop tool-calling: LLM bisa memanggil beberapa tool sebelum menjawab.
         thinking_anim = LoadingAnimation(THINKING_FRAMES)
         thinking_anim.start()
         for _ in range(10):  # batas iterasi agar tidak loop tak terbatas
             try:
-                msg, usage = call_llm(cfg, messages)
+                msg, usage = call_llm(cfg, compressed)
             except RuntimeError as e:
                 thinking_anim.stop()
                 print(f"\033[31m[error] {e}\033[0m")
@@ -844,7 +921,8 @@ def chat_loop(cfg):
                 thinking_anim.stop()
                 # Tampilkan token usage untuk tool call
                 if usage:
-                    print_token_usage(usage, total_usage)
+                    is_compressed = len(messages) > MAX_CONTEXT_MESSAGES
+                    print_token_usage(usage, total_usage, {"compressed": is_compressed})
                 tool_results = run_tool_calls(msg["tool_calls"])
                 messages.extend(tool_results)
                 # Mulai animasi thinking lagi untuk response berikutnya
@@ -858,7 +936,8 @@ def chat_loop(cfg):
             print(f"\n\033[36m{ASSISTANT_NAME}>\033[0m {content}")
             # Tampilkan token usage untuk response final
             if usage:
-                print_token_usage(usage, total_usage)
+                is_compressed = len(messages) > MAX_CONTEXT_MESSAGES
+                print_token_usage(usage, total_usage, {"compressed": is_compressed})
             break
         else:
             thinking_anim.stop()
