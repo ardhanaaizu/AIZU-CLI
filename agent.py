@@ -231,13 +231,13 @@ SYSTEM_PROMPT = (
     "\n\n"
     "PENTING - JANGAN LOOP:"
     "\n"
-    "- Jalankan perintah install HANYA SEKALI. Jangan cek status berulang kali."
+    "- Jalankan perintah install HANYA SEKALI. Output di-stream real-time, progress terlihat langsung."
     "\n"
-    "- Setelah run_shell, langsung berikan jawaban final ke user."
-    "\n"
-    "- Jika perintah timeout, bilang ke user untuk cek di terminal."
+    "- JANGAN cek status install berulang kali. JANGAN panggil run_shell lagi."
     "\n"
     "- JANGAN panggil run_shell dengan perintah yang sama lebih dari 1 kali."
+    "\n"
+    "- Setelah run_shell selesai, langsung jawab final ke user."
     "\n\n"
     "Gaya bicara: ringkas, jelas, langsung ke inti. Bahasa Indonesia."
     "\n"
@@ -882,8 +882,12 @@ def run_tool_calls(tool_calls):
                 elif name.startswith("git"):
                     anim.stop(f"  \033[32m↳ {name} ✓\033[0m")
                 elif name == "run_shell":
-                    lines = str(output).count("\n") + 1
-                    anim.stop(f"  \033[32m↳ Output: {lines} lines ✓\033[0m")
+                    if output.startswith("✅"):
+                        anim.stop(f"  \033[32m↳ Command completed ✓\033[0m")
+                    elif output.startswith("❌"):
+                        anim.stop(f"  \033[31m↳ Command failed ✗\033[0m")
+                    else:
+                        anim.stop(f"  \033[32m↳ Output received ✓\033[0m")
                 elif name in ("web_search", "web_fetch"):
                     anim.stop(f"  \033[32m↳ Data fetched ✓\033[0m")
                 elif name == "search_files":

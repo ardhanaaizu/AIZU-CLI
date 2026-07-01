@@ -15,6 +15,7 @@ Fitur:
 
 import os
 import re
+import sys
 import subprocess
 import urllib.request
 import urllib.error
@@ -67,69 +68,87 @@ def list_dir(path: str = ".") -> str:
         return f"ERROR membaca direktori: {e}"
 
 
-def run_shell(command: str, timeout: int = 300) -> str:
-    """Jalankan perintah shell di Termux dan kembalikan output-nya.
+def run_shell(command: str) -> str:
+    """Jalankan perintah shell di Termux.
 
-    Timeout default 300 detik (5 menit) untuk perintah panjang seperti install.
-    Perintah install (apt, pkg, npm, pip) otomatis dapat timeout lebih lama.
+    Perintah install/download di-stream real-time (progress terlihat langsung).
+    Tidak perlu manggil tool berulang kali.
     """
     low = command.lower()
     for bad in DANGEROUS:
         if bad in low:
             return f"DITOLAK: perintah berbahaya terdeteksi ('{bad}')."
 
-    # Deteksi perintah install/package manager - timeout lebih lama
-    install_patterns = [
-        "apt install", "apt update", "apt upgrade",
-        "pkg install", "pkg update", "pkg upgrade",
-        "npm install", "yarn install", "pnpm install",
-        "pip install", "pip3 install",
-        "brew install", "brew update",
-        "cargo install",
-        "git clone",
+    # Deteksi perintah yang perlu streaming
+    streaming_patterns = [
+        "apt ", "pkg ", "yum ", "dnf ",
+        "npm ", "yarn ", "pnpm ",
+        "pip ", "pip3 ",
+        "brew ", "cargo ",
+        "git clone", "git pull", "git fetch",
         "curl", "wget",
+        "tar ", "unzip",
+        "make", "cmake",
+        "docker", "podman",
     ]
-    is_long_running = any(pattern in low for pattern in install_patterns)
+    need_streaming = any(pattern in low for pattern in streaming_patterns)
 
-    # Timeout lebih lama untuk perintah install
-    actual_timeout = 600 if is_long_running else timeout  # 10 menit untuk install
-
-    try:
-        # Jalankan dengan subprocess.Popen untuk kontrol lebih baik
-        process = subprocess.Popen(
-            command,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
+    if need_streaming:
+        # Stream output real-time
         try:
-            stdout, stderr = process.communicate(timeout=actual_timeout)
-        except subprocess.TimeoutExpired:
-            # Timeout - beri info ke user
-            process.kill()
-            process.wait()
-            if is_long_running:
-                return (
-                    f"⏳ Perintah masih berjalan (timeout {actual_timeout}s).\n"
-                    f"Perintah: {command[:100]}\n"
-                    f"Tip: Jalankan perintah ini di terminal terpisah untuk hasil optimal."
-                )
-            else:
-                return f"ERROR: perintah melebihi batas waktu {actual_timeout} detik."
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
 
-        out = (stdout or "") + (stderr or "")
+            output_lines = []
+            line_count = 0
+
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    output_lines.append(line.rstrip())
+                    line_count += 1
+                    # Tampilkan progress (limit biar gak spam)
+                    if line_count <= 20 or line_count % 5 == 0:
+                        clean = line.rstrip()[:70]
+                        sys.stdout.write(f"\r\033[K  │ {clean}")
+                        sys.stdout.flush()
+
+            process.wait()
+
+            total = len(output_lines)
+            if total > 20:
+                sys.stdout.write(f"\r\033[K  │ ... ({total} lines)\n")
+                sys.stdout.flush()
+
+            final = "\n".join(output_lines[-15:])
+            if len(final) > 3000:
+                final = final[:3000] + "\n..."
+
+            if process.returncode != 0:
+                return f"❌ Error (kode {process.returncode}):\n{final}"
+            return f"✅ Selesai ({total} lines):\n{final}"
+
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    # Perintah biasa - langsung jalankan
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=120,
+        )
+        out = (result.stdout or "") + (result.stderr or "")
         if len(out) > 10000:
             out = out[:10000] + "\n... (terpotong)"
-
-        if process.returncode != 0:
-            return out.strip() or f"(selesai dengan error, kode keluar {process.returncode})"
-
-        return out.strip() or f"(selesai, kode keluar {process.returncode})"
-
+        return out.strip() or f"(selesai, kode {result.returncode})"
+    except subprocess.TimeoutExpired:
+        return f"⏳ Timeout. Jalankan langsung di terminal."
     except Exception as e:
-        return f"ERROR menjalankan perintah: {e}"
+        return f"ERROR: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +457,7 @@ SCHEMAS = [
         "type": "function",
         "function": {
             "name": "run_shell",
-            "description": "Jalankan perintah shell di Termux dan kembalikan output.",
+            "description": "Jalankan perintah shell. Install/download di-stream real-time.",
             "parameters": {
                 "type": "object",
                 "properties": {
