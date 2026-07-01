@@ -770,26 +770,14 @@ def run_tool_calls(tool_calls):
 
 
 def print_token_usage(usage, total_usage):
-    """Tampilkan konsumsi token."""
-    prompt_tokens = usage.get("prompt_tokens", 0)
-    completion_tokens = usage.get("completion_tokens", 0)
+    """Tampilkan konsumsi token secara simple."""
     total_tokens = usage.get("total_tokens", 0)
 
     # Update total
-    total_usage["prompt"] += prompt_tokens
-    total_usage["completion"] += completion_tokens
     total_usage["total"] += total_tokens
 
-    # Tampilkan
-    print(f"\033[90m  ┌─────────────────────────────────────┐\033[0m")
-    print(f"\033[90m  │\033[0m \033[33m📊 Token Usage\033[0m                      \033[90m│\033[0m")
-    print(f"\033[90m  ├─────────────────────────────────────┤\033[0m")
-    print(f"\033[90m  │\033[0m  Prompt:     \033[36m{prompt_tokens:>8}\033[0m tokens   \033[90m│\033[0m")
-    print(f"\033[90m  │\033[0m  Completion: \033[36m{completion_tokens:>8}\033[0m tokens   \033[90m│\033[0m")
-    print(f"\033[90m  │\033[0m  Total:      \033[32m{total_tokens:>8}\033[0m tokens   \033[90m│\033[0m")
-    print(f"\033[90m  ├─────────────────────────────────────┤\033[0m")
-    print(f"\033[90m  │\033[0m  \033[90mSession Total: \033[33m{total_usage['total']:>8}\033[0m tokens\033[90m │\033[0m")
-    print(f"\033[90m  └─────────────────────────────────────┘\033[0m")
+    # Tampilkan simple
+    print(f"\033[90m  ✻ {total_tokens} tokens\033[0m")
 
 
 def chat_loop(cfg):
