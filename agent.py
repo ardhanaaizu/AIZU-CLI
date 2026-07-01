@@ -37,38 +37,67 @@ import tools
 # Loading animation
 # ---------------------------------------------------------------------------
 THINKING_FRAMES = [
-    "\033[33m⟳\033[0m Berpikir",
-    "\033[33m⟳\033[0m Berpikir.",
-    "\033[33m⟳\033[0m Berpikir..",
-    "\033[33m⟳\033[0m Berpikir...",
+    "\033[33m✻\033[0m Berpikir",
+    "\033[33m✻\033[0m Berpikir.",
+    "\033[33m✻\033[0m Berpikir..",
+    "\033[33m✻\033[0m Berpikir...",
+    "\033[33m✻\033[0m Menalar",
+    "\033[33m✻\033[0m Menalar.",
+    "\033[33m✻\033[0m Menalar..",
+    "\033[33m✻\033[0m Memahami konteks",
+    "\033[33m✻\033[0m Memahami konteks.",
+    "\033[33m✻\033[0m Menghubungkan ide",
+    "\033[33m✻\033[0m Menghubungkan ide.",
 ]
 
 ANALYZING_FRAMES = [
-    "\033[36m🔍\033[0m Menganalisis",
-    "\033[36m🔍\033[0m Menganalisis.",
-    "\033[36m🔍\033[0m Menganalisis..",
-    "\033[36m🔍\033[0m Menganalisis...",
+    "\033[36m◎\033[0m Menganalisis",
+    "\033[36m◎\033[0m Menganalisis.",
+    "\033[36m◎\033[0m Menganalisis..",
+    "\033[36m◎\033[0m Memeriksa struktur",
+    "\033[36m◎\033[0m Memeriksa struktur.",
+    "\033[36m◎\033[0m Mengevaluasi",
+    "\033[36m◎\033[0m Mengevaluasi.",
 ]
 
 WORKING_FRAMES = [
-    "\033[32m⚙\033[0m Mengerjakan",
-    "\033[32m⚙\033[0m Mengerjakan.",
-    "\033[32m⚙\033[0m Mengerjakan..",
-    "\033[32m⚙\033[0m Mengerjakan...",
+    "\033[32m▸\033[0m Mengerjakan",
+    "\033[32m▸\033[0m Mengerjakan.",
+    "\033[32m▸\033[0m Mengerjakan..",
+    "\033[32m▸\033[0m Menyiapkan",
+    "\033[32m▸\033[0m Menyiapkan.",
+    "\033[32m▸\033[0m Memproses",
+    "\033[32m▸\033[0m Memproses.",
 ]
 
 SEARCHING_FRAMES = [
-    "\033[35m🌐\033[0m Mencari",
-    "\033[35m🌐\033[0m Mencari.",
-    "\033[35m🌐\033[0m Mencari..",
-    "\033[35m🌐\033[0m Mencari...",
+    "\033[35m◇\033[0m Mencari",
+    "\033[35m◇\033[0m Mencari.",
+    "\033[35m◇\033[0m Mencari..",
+    "\033[35m◇\033[0m Scanning",
+    "\033[35m◇\033[0m Scanning.",
+    "\033[35m◇\033[0m Mengambil data",
+    "\033[35m◇\033[0m Mengambil data.",
 ]
 
 TOOL_FRAMES = [
-    "\033[33m🔧\033[0m Menjalankan tool",
-    "\033[33m🔧\033[0m Menjalankan tool.",
-    "\033[33m🔧\033[0m Menjalankan tool..",
-    "\033[33m🔧\033[0m Menjalankan tool...",
+    "\033[33m→\033[0m Menjalankan",
+    "\033[33m→\033[0m Menjalankan.",
+    "\033[33m→\033[0m Menjalankan..",
+    "\033[33m→\033[0m Executing",
+    "\033[33m→\033[0m Executing.",
+]
+
+CODING_FRAMES = [
+    "\033[32m✎\033[0m Menulis kode",
+    "\033[32m✎\033[0m Menulis kode.",
+    "\033[32m✎\033[0m Menulis kode..",
+    "\033[32m✎\033[0m Editing line",
+    "\033[32m✎\033[0m Editing line.",
+    "\033[32m✎\033[0m Writing function",
+    "\033[32m✎\033[0m Writing function.",
+    "\033[32m✎\033[0m Implementing",
+    "\033[32m✎\033[0m Implementing.",
 ]
 
 
@@ -118,8 +147,19 @@ def show_tool_animation(tool_name, args):
         anim = LoadingAnimation(SEARCHING_FRAMES)
     elif "git" in tool_name:
         anim = LoadingAnimation(WORKING_FRAMES)
-    elif "edit" in tool_name or "write" in tool_name:
-        anim = LoadingAnimation(WORKING_FRAMES)
+    elif "edit" in tool_name:
+        anim = LoadingAnimation(CODING_FRAMES)
+        # Tampilkan info file yang diedit
+        path = args.get("path", "")
+        if path:
+            anim.stop(f"  \033[32m✎\033[0m Editing \033[36m{path}\033[0m")
+            anim.start()
+    elif "write" in tool_name:
+        anim = LoadingAnimation(CODING_FRAMES)
+        path = args.get("path", "")
+        if path:
+            anim.stop(f"  \033[32m✎\033[0m Writing \033[36m{path}\033[0m")
+            anim.start()
     else:
         anim = LoadingAnimation(TOOL_FRAMES)
     anim.start()
@@ -815,13 +855,37 @@ def run_tool_calls(tool_calls):
         else:
             try:
                 output = fn(**args)
-                # Tampilkan ringkasan hasil
-                result_preview = str(output)[:80]
-                if len(str(output)) > 80:
-                    result_preview += "..."
-                anim.stop(f"  \033[32m↳ {name} → {result_preview}\033[0m")
+                # Tampilkan ringkasan hasil sesuai tool
+                if name == "edit_file":
+                    anim.stop(f"  \033[32m↳ File updated ✓\033[0m")
+                elif name == "write_file":
+                    path = args.get("path", "")
+                    content = args.get("content", "")
+                    lines = content.count("\n") + 1
+                    anim.stop(f"  \033[32m↳ Wrote {lines} lines to {path} ✓\033[0m")
+                elif name == "read_file":
+                    lines = str(output).count("\n") + 1
+                    anim.stop(f"  \033[32m↳ Read {lines} lines ✓\033[0m")
+                elif name == "list_dir":
+                    items = str(output).count("\n") + 1
+                    anim.stop(f"  \033[32m↳ {items} items ✓\033[0m")
+                elif name.startswith("git"):
+                    anim.stop(f"  \033[32m↳ {name} ✓\033[0m")
+                elif name == "run_shell":
+                    lines = str(output).count("\n") + 1
+                    anim.stop(f"  \033[32m↳ Output: {lines} lines ✓\033[0m")
+                elif name in ("web_search", "web_fetch"):
+                    anim.stop(f"  \033[32m↳ Data fetched ✓\033[0m")
+                elif name == "search_files":
+                    count = str(output).count("\n") + 1
+                    anim.stop(f"  \033[32m↳ Found {count} results ✓\033[0m")
+                else:
+                    result_preview = str(output)[:60]
+                    if len(str(output)) > 60:
+                        result_preview += "..."
+                    anim.stop(f"  \033[32m↳ {result_preview}\033[0m")
             except Exception as e:
-                anim.stop(f"  \033[31m↳ ERROR menjalankan {name}: {e}\033[0m")
+                anim.stop(f"  \033[31m↳ ERROR: {e}\033[0m")
                 output = f"ERROR menjalankan {name}: {e}"
 
         results.append({
@@ -901,8 +965,9 @@ def chat_loop(cfg):
             compressed = messages
 
         # Loop tool-calling: LLM bisa memanggil beberapa tool sebelum menjawab.
-        thinking_anim = LoadingAnimation(THINKING_FRAMES)
+        thinking_anim = LoadingAnimation(THINKING_FRAMES, delay=0.2)
         thinking_anim.start()
+        time.sleep(0.5)  # Biar user lihat animasi awal
         for _ in range(10):  # batas iterasi agar tidak loop tak terbatas
             try:
                 msg, usage = call_llm(cfg, compressed)
