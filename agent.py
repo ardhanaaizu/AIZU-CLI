@@ -628,6 +628,10 @@ def handle_slash(line, cfg, messages):
 def call_llm(cfg, messages, use_tools=True, timeout=180, _retried=False):
     """Kirim permintaan ke endpoint chat completions (format OpenAI).
 
+    Return: (message, usage) di mana:
+    - message: dict balasan LLM
+    - usage: dict token usage (prompt_tokens, completion_tokens, total_tokens)
+
     - Bila endpoint menolak parameter `tools` (HTTP 400/404/422, umum pada provider
       custom yang tidak mendukung function-calling), otomatis dicoba ulang tanpa tools.
     - Bila respons timeout (server lambat / cold-start, sering pada NVIDIA NIM),
@@ -652,7 +656,9 @@ def call_llm(cfg, messages, use_tools=True, timeout=180, _retried=False):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-        return body["choices"][0]["message"]
+        message = body["choices"][0]["message"]
+        usage = body.get("usage", {})
+        return message, usage
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")
         # Banyak endpoint custom menolak parameter tools/function. Coba lagi tanpa tools.
@@ -763,6 +769,29 @@ def run_tool_calls(tool_calls):
     return results
 
 
+def print_token_usage(usage, total_usage):
+    """Tampilkan konsumsi token."""
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    total_tokens = usage.get("total_tokens", 0)
+
+    # Update total
+    total_usage["prompt"] += prompt_tokens
+    total_usage["completion"] += completion_tokens
+    total_usage["total"] += total_tokens
+
+    # Tampilkan
+    print(f"\033[90m  ┌─────────────────────────────────────┐\033[0m")
+    print(f"\033[90m  │\033[0m \033[33m📊 Token Usage\033[0m                      \033[90m│\033[0m")
+    print(f"\033[90m  ├─────────────────────────────────────┤\033[0m")
+    print(f"\033[90m  │\033[0m  Prompt:     \033[36m{prompt_tokens:>8}\033[0m tokens   \033[90m│\033[0m")
+    print(f"\033[90m  │\033[0m  Completion: \033[36m{completion_tokens:>8}\033[0m tokens   \033[90m│\033[0m")
+    print(f"\033[90m  │\033[0m  Total:      \033[32m{total_tokens:>8}\033[0m tokens   \033[90m│\033[0m")
+    print(f"\033[90m  ├─────────────────────────────────────┤\033[0m")
+    print(f"\033[90m  │\033[0m  \033[90mSession Total: \033[33m{total_usage['total']:>8}\033[0m tokens\033[90m │\033[0m")
+    print(f"\033[90m  └─────────────────────────────────────┘\033[0m")
+
+
 def chat_loop(cfg):
     mode = cfg.get("mode", DEFAULT_MODE)
     # Clear screen sebelum tampilkan banner
@@ -780,6 +809,7 @@ def chat_loop(cfg):
         print("\033[33m[info] API key belum diatur. Atur dengan: /key <api-key>\033[0m")
 
     messages = [{"role": "system", "content": build_system_prompt(mode)}]
+    total_usage = {"prompt": 0, "completion": 0, "total": 0}
 
     while True:
         print()
@@ -810,7 +840,7 @@ def chat_loop(cfg):
         thinking_anim.start()
         for _ in range(10):  # batas iterasi agar tidak loop tak terbatas
             try:
-                msg = call_llm(cfg, messages)
+                msg, usage = call_llm(cfg, messages)
             except RuntimeError as e:
                 thinking_anim.stop()
                 print(f"\033[31m[error] {e}\033[0m")
@@ -824,6 +854,9 @@ def chat_loop(cfg):
 
             if msg.get("tool_calls"):
                 thinking_anim.stop()
+                # Tampilkan token usage untuk tool call
+                if usage:
+                    print_token_usage(usage, total_usage)
                 tool_results = run_tool_calls(msg["tool_calls"])
                 messages.extend(tool_results)
                 # Mulai animasi thinking lagi untuk response berikutnya
@@ -835,6 +868,9 @@ def chat_loop(cfg):
             thinking_anim.stop()
             content = msg.get("content") or "(tidak ada jawaban)"
             print(f"\n\033[36m{ASSISTANT_NAME}>\033[0m {content}")
+            # Tampilkan token usage untuk response final
+            if usage:
+                print_token_usage(usage, total_usage)
             break
         else:
             thinking_anim.stop()
