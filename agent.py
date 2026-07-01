@@ -968,7 +968,10 @@ def chat_loop(cfg):
         thinking_anim = LoadingAnimation(THINKING_FRAMES, delay=0.2)
         thinking_anim.start()
         time.sleep(0.5)  # Biar user lihat animasi awal
-        for _ in range(10):  # batas iterasi agar tidak loop tak terbatas
+        tool_call_count = 0
+        MAX_TOOL_CALLS = 20  # Naikkan batas
+
+        for _ in range(MAX_TOOL_CALLS):
             try:
                 msg, usage = call_llm(cfg, compressed)
             except RuntimeError as e:
@@ -983,13 +986,35 @@ def chat_loop(cfg):
             messages.append(assistant_msg)
 
             if msg.get("tool_calls"):
+                tool_call_count += 1
                 thinking_anim.stop()
                 # Tampilkan token usage untuk tool call
                 if usage:
                     is_compressed = len(messages) > MAX_CONTEXT_MESSAGES
                     print_token_usage(usage, total_usage, {"compressed": is_compressed})
+
+                # Cek apakah tool call sudah terlalu banyak
+                if tool_call_count >= MAX_TOOL_CALLS:
+                    print(f"\033[33m[info] {tool_call_count} tool calls dilakukan, memberikan jawaban final...\033[0m")
+                    # Minta LLM untuk memberikan jawaban final
+                    messages.append({"role": "user", "content": "Berikan jawaban final sekarang, jangan panggil tool lagi."})
+                    try:
+                        final_msg, final_usage = call_llm(cfg, messages)
+                        final_content = final_msg.get("content") or "(tidak ada jawaban)"
+                        print(f"\n\033[36m{ASSISTANT_NAME}>\033[0m {final_content}")
+                        if final_usage:
+                            print_token_usage(final_usage, total_usage)
+                    except:
+                        pass
+                    break
+
                 tool_results = run_tool_calls(msg["tool_calls"])
                 messages.extend(tool_results)
+
+                # Kompresi lagi jika perlu
+                if len(messages) > MAX_CONTEXT_MESSAGES:
+                    compressed = compress_messages(messages)
+
                 # Mulai animasi thinking lagi untuk response berikutnya
                 thinking_anim = LoadingAnimation(THINKING_FRAMES)
                 thinking_anim.start()
@@ -1006,7 +1031,7 @@ def chat_loop(cfg):
             break
         else:
             thinking_anim.stop()
-            print("\033[31m[error] terlalu banyak pemanggilan tool, dihentikan.\033[0m")
+            print(f"\033[33m[info] Selesai setelah {MAX_TOOL_CALLS} tool calls\033[0m")
 
 
 def choose_model_interactive(cfg, models):
