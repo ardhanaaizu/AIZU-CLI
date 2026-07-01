@@ -17,6 +17,8 @@ Konfigurasi lewat environment variable atau file config.json:
 import json
 import os
 import sys
+import threading
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -29,6 +31,99 @@ except ImportError:           # Windows / lingkungan tanpa termios
     _HAS_TTY = False
 
 import tools
+
+
+# ---------------------------------------------------------------------------
+# Loading animation
+# ---------------------------------------------------------------------------
+THINKING_FRAMES = [
+    "\033[33m⟳\033[0m Berpikir",
+    "\033[33m⟳\033[0m Berpikir.",
+    "\033[33m⟳\033[0m Berpikir..",
+    "\033[33m⟳\033[0m Berpikir...",
+]
+
+ANALYZING_FRAMES = [
+    "\033[36m🔍\033[0m Menganalisis",
+    "\033[36m🔍\033[0m Menganalisis.",
+    "\033[36m🔍\033[0m Menganalisis..",
+    "\033[36m🔍\033[0m Menganalisis...",
+]
+
+WORKING_FRAMES = [
+    "\033[32m⚙\033[0m Mengerjakan",
+    "\033[32m⚙\033[0m Mengerjakan.",
+    "\033[32m⚙\033[0m Mengerjakan..",
+    "\033[32m⚙\033[0m Mengerjakan...",
+]
+
+SEARCHING_FRAMES = [
+    "\033[35m🌐\033[0m Mencari",
+    "\033[35m🌐\033[0m Mencari.",
+    "\033[35m🌐\033[0m Mencari..",
+    "\033[35m🌐\033[0m Mencari...",
+]
+
+TOOL_FRAMES = [
+    "\033[33m🔧\033[0m Menjalankan tool",
+    "\033[33m🔧\033[0m Menjalankan tool.",
+    "\033[33m🔧\033[0m Menjalankan tool..",
+    "\033[33m🔧\033[0m Menjalankan tool...",
+]
+
+
+class LoadingAnimation:
+    """Animasi loading sederhana untuk terminal."""
+
+    def __init__(self, frames=None, delay=0.15):
+        self.frames = frames or THINKING_FRAMES
+        self.delay = delay
+        self.running = False
+        self.thread = None
+        self.frame_idx = 0
+
+    def start(self, text=None):
+        """Mulai animasi loading."""
+        self.running = True
+        self.frame_idx = 0
+        if text:
+            self.frames = [f"{text}"] * len(self.frames)
+        self.thread = threading.Thread(target=self._animate, daemon=True)
+        self.thread.start()
+
+    def _animate(self):
+        """Thread animasi."""
+        while self.running:
+            sys.stdout.write(f"\r\033[K{self.frames[self.frame_idx % len(self.frames)]}")
+            sys.stdout.flush()
+            self.frame_idx += 1
+            time.sleep(self.delay)
+
+    def stop(self, final_text=None):
+        """Hentikan animasi dan tampilkan teks akhir."""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=0.5)
+        # Bersihkan baris
+        sys.stdout.write(f"\r\033[K")
+        sys.stdout.flush()
+        if final_text:
+            sys.stdout.write(f"\r{final_text}\n")
+            sys.stdout.flush()
+
+
+def show_tool_animation(tool_name, args):
+    """Tampilkan animasi saat menjalankan tool."""
+    if "search" in tool_name or "fetch" in tool_name:
+        anim = LoadingAnimation(SEARCHING_FRAMES)
+    elif "git" in tool_name:
+        anim = LoadingAnimation(WORKING_FRAMES)
+    elif "edit" in tool_name or "write" in tool_name:
+        anim = LoadingAnimation(WORKING_FRAMES)
+    else:
+        anim = LoadingAnimation(TOOL_FRAMES)
+    anim.start()
+    return anim
 
 # ---------------------------------------------------------------------------
 # Preset backend: base_url + model default. Semua pakai format OpenAI.
@@ -67,12 +162,36 @@ PRESETS = {
 }
 
 SYSTEM_PROMPT = (
-    "Namamu adalah Aizu, sebuah asisten AI CLI yang berjalan di Termux (Android). "
-    "Bila ditanya siapa namamu atau identitasmu, jawab bahwa kamu adalah Aizu. "
-    "Kamu bisa membaca/menulis file, melihat direktori, dan menjalankan perintah shell "
-    "lewat tool yang tersedia. Gunakan tool bila perlu untuk menyelesaikan permintaan user. "
-    "Jawab ringkas dan jelas dalam bahasa Indonesia. "
-    "Untuk perintah yang berisiko menghapus/menimpa data, jelaskan dulu sebelum menjalankan."
+    "Namamu adalah Aizu, asisten AI CLI yang cerdas dan membantu. "
+    "Bila ditanya siapa namamu, jawab bahwa kamu adalah Aizu. "
+    "\n\n"
+    "KAMU MEMILIKI TOOL BERIKUT (gunakan bila diperlukan):"
+    "\n"
+    "📁 File: read_file, write_file, edit_file, list_dir, search_files"
+    "\n"
+    "🌐 Web: web_search (cari internet), web_fetch (ambil dari URL)"
+    "\n"
+    "🔧 Git: git_status, git_log, git_diff, git_add, git_commit, git_push, git_pull, git_branch, git_checkout"
+    "\n"
+    "💻 Shell: run_shell (jalankan perintah terminal)"
+    "\n\n"
+    "ATURAN KERJA:"
+    "\n"
+    "1. Gunakan tool secara aktif untuk menyelesaikan tugas. Jangan hanya menjelaskan — LAKUKAN."
+    "\n"
+    "2. Untuk tugas kompleks, pecah menjadi langkah-langkah dan kerjakan satu per satu."
+    "\n"
+    "3. Selalu cek status dulu sebelum melakukan sesuatu (misal: git status sebelum commit)."
+    "\n"
+    "4. Untuk edit file, gunakan edit_file (bukan write_file) supaya lebih presisi."
+    "\n"
+    "5. Bila butuh informasi dari internet, gunakan web_search atau web_fetch."
+    "\n"
+    "6. Bila ditanya sesuatu yang butuh riset, cari dulu di internet."
+    "\n\n"
+    "Gaya bicara: ringkas, jelas, langsung ke inti. Bahasa Indonesia."
+    "\n"
+    "Untuk perintah berbahaya (hapus file, overwrite), jelaskan dulu sebelum jalankan."
 )
 
 # Nama identitas asisten — dipakai sebagai label balasan di terminal.
@@ -111,6 +230,18 @@ MODES = {
         "desc": "Asisten terminal, utamakan perintah shell",
         "extra": " Utamakan penyelesaian lewat perintah shell. "
                  "Selalu jelaskan perintah sebelum menjalankannya.",
+    },
+    "detail": {
+        "desc": "Jawaban lengkap dengan penjelasan mendalam",
+        "extra": " Berikan penjelasan lengkap, mendalam, dan terstruktur. "
+                 "Sertakan contoh, langkah-langkah, dan tips tambahan. "
+                 "Cocok untuk belajar atau tugas rumit.",
+    },
+    "git": {
+        "desc": "Fokus pada pekerjaan git",
+        "extra": " Fokus pada workflow git. "
+                 "Selalu cek status sebelum commit. "
+                 "Buat commit message yang jelas dan deskriptif.",
     },
 }
 DEFAULT_MODE = "chat"
@@ -276,12 +407,18 @@ SLASH_HELP = """Perintah yang tersedia:
   /url <base-url>      atur base URL endpoint (opsional)
   /save                simpan pengaturan ke config.json
   /tools               daftar tool yang bisa dipakai agent
-  /mode [nama]         lihat/ganti mode kerja (chat, code, ringkas, shell)
+  /mode [nama]         lihat/ganti mode (chat, code, ringkas, shell, detail, git)
   /models [kata]       cari & pilih model yang tersedia dari provider
   /provider            setup ulang provider custom (URL + key + model)
   /providers           pilih provider custom yang tersimpan (per domain)
   /reset               hapus riwayat percakapan
-  /keluar              keluar dari agent"""
+  /keluar              keluar dari agent
+
+Tool yang tersedia:
+  File    : read_file, write_file, edit_file, list_dir, search_files
+  Web     : web_search, web_fetch
+  Git     : git_status, git_log, git_diff, git_add, git_commit, git_push, git_pull, git_branch, git_checkout
+  Shell   : run_shell"""
 
 
 # Daftar slash command untuk autocomplete (nama, keterangan singkat).
@@ -598,14 +735,26 @@ def run_tool_calls(tool_calls):
         except json.JSONDecodeError:
             args = {}
         fn = tools.REGISTRY.get(name)
-        print(f"  \033[33m↳ menjalankan tool: {name}({args})\033[0m")
+
+        # Tampilkan animasi loading
+        anim = show_tool_animation(name, args)
+        time.sleep(0.3)  # Biar animasi terlihat
+
         if fn is None:
+            anim.stop(f"  \033[31m↳ ERROR: tool '{name}' tidak ditemukan.\033[0m")
             output = f"ERROR: tool '{name}' tidak ditemukan."
         else:
             try:
                 output = fn(**args)
+                # Tampilkan ringkasan hasil
+                result_preview = str(output)[:80]
+                if len(str(output)) > 80:
+                    result_preview += "..."
+                anim.stop(f"  \033[32m↳ {name} → {result_preview}\033[0m")
             except Exception as e:
+                anim.stop(f"  \033[31m↳ ERROR menjalankan {name}: {e}\033[0m")
                 output = f"ERROR menjalankan {name}: {e}"
+
         results.append({
             "role": "tool",
             "tool_call_id": tc["id"],
@@ -616,6 +765,8 @@ def run_tool_calls(tool_calls):
 
 def chat_loop(cfg):
     mode = cfg.get("mode", DEFAULT_MODE)
+    # Clear screen sebelum tampilkan banner
+    print("\033[2J\033[H", end="")
     print("\033[36m" + BANNER + "\033[0m")
     print("\033[36m" + "=" * 54 + "\033[0m")
     print(f"  Provider : \033[32m{cfg['backend']}\033[0m")
@@ -655,10 +806,13 @@ def chat_loop(cfg):
         messages.append({"role": "user", "content": user})
 
         # Loop tool-calling: LLM bisa memanggil beberapa tool sebelum menjawab.
+        thinking_anim = LoadingAnimation(THINKING_FRAMES)
+        thinking_anim.start()
         for _ in range(10):  # batas iterasi agar tidak loop tak terbatas
             try:
                 msg = call_llm(cfg, messages)
             except RuntimeError as e:
+                thinking_anim.stop()
                 print(f"\033[31m[error] {e}\033[0m")
                 break
 
@@ -669,15 +823,21 @@ def chat_loop(cfg):
             messages.append(assistant_msg)
 
             if msg.get("tool_calls"):
+                thinking_anim.stop()
                 tool_results = run_tool_calls(msg["tool_calls"])
                 messages.extend(tool_results)
+                # Mulai animasi thinking lagi untuk response berikutnya
+                thinking_anim = LoadingAnimation(THINKING_FRAMES)
+                thinking_anim.start()
                 continue  # kirim hasil tool kembali ke LLM
 
             # Tidak ada tool call -> ini jawaban final.
+            thinking_anim.stop()
             content = msg.get("content") or "(tidak ada jawaban)"
             print(f"\n\033[36m{ASSISTANT_NAME}>\033[0m {content}")
             break
         else:
+            thinking_anim.stop()
             print("\033[31m[error] terlalu banyak pemanggilan tool, dihentikan.\033[0m")
 
 
