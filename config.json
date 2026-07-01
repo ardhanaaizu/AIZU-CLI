@@ -1,0 +1,14 @@
+{
+  "backend": "custom",
+  "api_key": "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",
+  "model": "deepseek-ai/deepseek-v4-flash",
+  "base_url": "https://integrate.api.nvidia.com/v1",
+  "mode": "chat",
+  "saved_providers": {
+    "integrate.api.nvidia.com": {
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "api_key": "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",
+      "model": "deepseek-ai/deepseek-v4-flash"
+    }
+  }
+}

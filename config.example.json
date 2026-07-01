@@ -1,0 +1,5 @@
+{
+  "backend": "groq",
+  "api_key": "ISI_API_KEY_KAMU_DI_SINI",
+  "model": "llama-3.3-70b-versatile"
+}
