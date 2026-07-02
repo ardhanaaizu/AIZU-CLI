@@ -357,6 +357,172 @@ def git_checkout(branch: str) -> str:
     return run_shell(f"git checkout {branch}")
 
 
+# ---------------------------------------------------------------------------
+# Enhanced tools (Claude Code style)
+# ---------------------------------------------------------------------------
+
+def glob_files(pattern: str, path: str = ".") -> str:
+    """Cari file berdasarkan glob pattern (recursive).
+
+    Mirip dengan Glob tool di Claude Code.
+    Contoh: '*.py', 'src/**/*.js', '**/*.txt'
+    """
+    try:
+        path = os.path.expanduser(path)
+        search_pattern = os.path.join(path, pattern)
+
+        # Use glob with recursive support
+        if '**' in pattern:
+            files = glob.glob(search_pattern, recursive=True)
+        else:
+            files = glob.glob(search_pattern, recursive=True)
+
+        if not files:
+            return f"Tidak ditemukan file dengan pattern: {pattern}"
+
+        # Sort and format
+        files.sort()
+        result_lines = []
+        for f in files[:100]:  # Limit 100 results
+            rel = os.path.relpath(f, path)
+            if os.path.isfile(f):
+                size = os.path.getsize(f)
+                result_lines.append(f"  {rel} ({size} bytes)")
+            elif os.path.isdir(f):
+                result_lines.append(f"  {rel}/ (dir)")
+
+        count = len(files)
+        header = f"📂 Ditemukan {count} file" + (f" (menampilkan 100)" if count > 100 else "")
+        return header + ":\n" + "\n".join(result_lines)
+    except Exception as e:
+        return f"ERROR glob: {e}"
+
+
+def grep_content(pattern: str, path: str = ".", include: str = "", max_results: int = 50) -> str:
+    """Cari pattern (regex) di dalam file.
+
+    Mirip dengan Grep tool di Claude Code.
+    - pattern: regex pattern yang dicari
+    - path: direktori pencarian
+    - include: filter file (mis. '*.py', '*.js')
+    - max_results: jumlah maksimal hasil
+    """
+    try:
+        path = os.path.expanduser(path)
+        results = []
+        compiled = re.compile(pattern, re.IGNORECASE)
+
+        for root, dirs, files in os.walk(path):
+            # Skip hidden dirs
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+
+            for fname in files:
+                # Filter by include pattern
+                if include:
+                    import fnmatch
+                    if not fnmatch.fnmatch(fname, include):
+                        continue
+
+                fpath = os.path.join(root, fname)
+                try:
+                    # Skip binary files
+                    with open(fpath, 'rb') as f:
+                        chunk = f.read(8192)
+                        if b'\x00' in chunk:
+                            continue
+
+                    with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                        for i, line in enumerate(f, 1):
+                            if compiled.search(line):
+                                rel = os.path.relpath(fpath, path)
+                                results.append(f"  {rel}:{i}: {line.strip()[:120]}")
+                                if len(results) >= max_results:
+                                    break
+                except (IOError, UnicodeDecodeError):
+                    pass
+
+                if len(results) >= max_results:
+                    break
+            if len(results) >= max_results:
+                break
+
+        if not results:
+            return f"Tidak ditemukan pattern '{pattern}' di {path}"
+
+        header = f"🔍 Ditemukan {len(results)} hasil" + (" (limit)" if len(results) >= max_results else "")
+        return header + ":\n" + "\n".join(results)
+    except re.error as e:
+        return f"ERROR regex tidak valid: {e}"
+    except Exception as e:
+        return f"ERROR grep: {e}"
+
+
+def read_file_lines(path: str, offset: int = 0, limit: int = 50) -> str:
+    """Baca file dengan offset dan limit (berdasarkan baris).
+
+    Mirip dengan Read tool di Claude Code yang support offset/limit.
+    - path: file yang dibaca
+    - offset: baris mulai (0-based)
+    - limit: jumlah baris yang dibaca
+    """
+    try:
+        path = os.path.expanduser(path)
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+
+        total = len(lines)
+        if offset >= total:
+            return f"ERROR: offset {offset} melebihi jumlah baris ({total})"
+
+        end = min(offset + limit, total)
+        selected = lines[offset:end]
+
+        # Format with line numbers (1-based)
+        result_lines = []
+        for i, line in enumerate(selected, start=offset + 1):
+            result_lines.append(f"{i:4d}\t{line.rstrip()}")
+
+        header = f"📄 {path} (baris {offset+1}-{end} dari {total})"
+        return header + "\n" + "\n".join(result_lines)
+    except Exception as e:
+        return f"ERROR membaca file: {e}"
+
+
+def edit_file_improved(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """Edit file dengan exact string replacement (lebih presisi).
+
+    Mirip dengan Edit tool di Claude Code.
+    - old_string: teks yang dicari (harus match persis termasuk indentasi)
+    - new_string: teks pengganti
+    - replace_all: jika True, ganti semua kemunculan; jika False, hanya yang pertama
+    """
+    try:
+        path = os.path.expanduser(path)
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+
+        if old_string not in content:
+            return f"ERROR: string tidak ditemukan di {path}.\nPastikan string match persis termasuk indentasi dan newline."
+
+        count = content.count(old_string)
+
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+            replaced = count
+        else:
+            if count > 1:
+                return f"ERROR: ditemukan {count} kemunculan. Gunakan replace_all=True untuk ganti semua, atau buat string lebih spesifik."
+            new_content = content.replace(old_string, new_string, 1)
+            replaced = 1
+
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+
+        return f"OK: {replaced} kemunculan diganti di {path}"
+    except Exception as e:
+        return f"ERROR edit: {e}"
+
+
 # Peta nama tool -> fungsi
 REGISTRY = {
     "read_file": read_file,
@@ -376,6 +542,10 @@ REGISTRY = {
     "git_pull": git_pull,
     "git_branch": git_branch,
     "git_checkout": git_checkout,
+    "glob_files": glob_files,
+    "grep_content": grep_content,
+    "read_file_lines": read_file_lines,
+    "edit_file_improved": edit_file_improved,
 }
 
 # Skema tool dalam format OpenAI function-calling.
@@ -607,6 +777,71 @@ SCHEMAS = [
                     "branch": {"type": "string", "description": "Nama branch tujuan"},
                 },
                 "required": ["branch"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob_files",
+            "description": "Cari file berdasarkan glob pattern (recursive). Contoh: '*.py', 'src/**/*.js'",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern untuk mencari file"},
+                    "path": {"type": "string", "description": "Direktori pencarian (default '.')"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep_content",
+            "description": "Cari pattern (regex) di dalam file. Mirip grep tapi dengan regex support.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern yang dicari"},
+                    "path": {"type": "string", "description": "Direktori pencarian (default '.')"},
+                    "include": {"type": "string", "description": "Filter file (mis. '*.py', '*.js')"},
+                    "max_results": {"type": "integer", "description": "Jumlah maksimal hasil (default 50)"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file_lines",
+            "description": "Baca file dengan offset dan limit baris. Berguna untuk file besar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path file yang dibaca"},
+                    "offset": {"type": "integer", "description": "Baris mulai (0-based, default 0)"},
+                    "limit": {"type": "integer", "description": "Jumlah baris (default 50)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file_improved",
+            "description": "Edit file dengan exact string replacement. Lebih presisi dari edit_file biasa.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path file yang diedit"},
+                    "old_string": {"type": "string", "description": "String yang dicari (harus match persis)"},
+                    "new_string": {"type": "string", "description": "String pengganti"},
+                    "replace_all": {"type": "boolean", "description": "Ganti semua kemunculan (default false)"},
+                },
+                "required": ["path", "old_string", "new_string"],
             },
         },
     },
