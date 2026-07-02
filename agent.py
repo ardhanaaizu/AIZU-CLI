@@ -33,7 +33,7 @@ except ImportError:           # Windows / lingkungan tanpa termios
 
 import tools
 from plugins import PluginManager, HookManager, SubAgent, SpecializedAgent, BackgroundAgentManager, AGENT_TYPES, list_plugins
-from tui import AizuTUI, StreamingTUI, Terminal, Colors, ThinkingIndicator
+from tui import AizuTUI, StreamingTUI, Colors
 from tasks import TaskManager, get_task_manager
 from memory import get_memory_manager, create_memory_tools
 from skills import get_skill_manager
