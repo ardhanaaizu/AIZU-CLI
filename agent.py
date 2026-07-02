@@ -2102,88 +2102,88 @@ def chat_loop(cfg):
                     "content": memory_context
                 })
 
-        # Kompresi pesan untuk hemat token (prompt caching)
-        if len(messages) > MAX_CONTEXT_MESSAGES:
-            compressed = compress_messages(messages, cfg=cfg)
-            # Tampilkan info kompresi
-            old_count = len(messages)
-            new_count = len(compressed)
-            saved = old_count - new_count
-            tui.add_info(f"Context compressed: {old_count} → {new_count} messages (saved {saved})")
-        else:
-            compressed = messages
+            # Kompresi pesan untuk hemat token (prompt caching)
+            if len(messages) > MAX_CONTEXT_MESSAGES:
+                compressed = compress_messages(messages, cfg=cfg)
+                # Tampilkan info kompresi
+                old_count = len(messages)
+                new_count = len(compressed)
+                saved = old_count - new_count
+                tui.add_info(f"Context compressed: {old_count} → {new_count} messages (saved {saved})")
+            else:
+                compressed = messages
 
-        # Loop tool-calling: LLM bisa memanggil beberapa tool sebelum menjawab.
-        tui.start_thinking("Thinking", "ctrl+o to expand")
-        tool_call_count = 0
-        MAX_TOOL_CALLS = 20  # Naikkan batas
+            # Loop tool-calling: LLM bisa memanggil beberapa tool sebelum menjawab.
+            tui.start_thinking("Thinking", "ctrl+o to expand")
+            tool_call_count = 0
+            MAX_TOOL_CALLS = 20  # Naikkan batas
 
-        for _ in range(MAX_TOOL_CALLS):
-            try:
-                # Use streaming by default, fallback to non-streaming on error
+            for _ in range(MAX_TOOL_CALLS):
                 try:
-                    msg, usage = call_llm_streaming(cfg, compressed, hook_mgr=hook_mgr)
-                except RuntimeError as streaming_error:
-                    # Fallback to non-streaming
+                    # Use streaming by default, fallback to non-streaming on error
+                    try:
+                        msg, usage = call_llm_streaming(cfg, compressed, hook_mgr=hook_mgr)
+                    except RuntimeError as streaming_error:
+                        # Fallback to non-streaming
+                        tui.stop_thinking()
+                        tui.add_info("Streaming tidak support, menggunakan non-streaming...")
+                        tui.start_thinking("Thinking", "ctrl+o to expand")
+                        msg, usage = call_llm(cfg, compressed, hook_mgr=hook_mgr)
+                    # Stop thinking
                     tui.stop_thinking()
-                    tui.add_info("Streaming tidak support, menggunakan non-streaming...")
-                    tui.start_thinking("Thinking", "ctrl+o to expand")
-                    msg, usage = call_llm(cfg, compressed, hook_mgr=hook_mgr)
-                # Stop thinking
-                tui.stop_thinking()
-            except RuntimeError as e:
-                hook_mgr.emit('on_error', error=e, context={'phase': 'llm_call'})
-                tui.stop_thinking()
-                tui.add_error(str(e))
-                break
+                except RuntimeError as e:
+                    hook_mgr.emit('on_error', error=e, context={'phase': 'llm_call'})
+                    tui.stop_thinking()
+                    tui.add_error(str(e))
+                    break
 
-            # Simpan balasan asisten (termasuk permintaan tool bila ada).
-            assistant_msg = {"role": "assistant", "content": msg.get("content") or ""}
-            if msg.get("tool_calls"):
-                assistant_msg["tool_calls"] = msg["tool_calls"]
-            messages.append(assistant_msg)
+                # Simpan balasan asisten (termasuk permintaan tool bila ada).
+                assistant_msg = {"role": "assistant", "content": msg.get("content") or ""}
+                if msg.get("tool_calls"):
+                    assistant_msg["tool_calls"] = msg["tool_calls"]
+                messages.append(assistant_msg)
 
-            if msg.get("tool_calls"):
-                tool_call_count += 1
-                # Tampilkan token usage untuk tool call
+                if msg.get("tool_calls"):
+                    tool_call_count += 1
+                    # Tampilkan token usage untuk tool call
+                    if usage:
+                        is_compressed = len(messages) > MAX_CONTEXT_MESSAGES
+                        print_token_usage(usage, total_usage, {"compressed": is_compressed}, model=cfg.get("model"))
+
+                    # Cek apakah tool call sudah terlalu banyak
+                    if tool_call_count >= MAX_TOOL_CALLS:
+                        tui.add_info(f"{tool_call_count} tool calls dilakukan, memberikan jawaban final...")
+                        # Minta LLM untuk memberikan jawaban final
+                        messages.append({"role": "user", "content": "Berikan jawaban final sekarang, jangan panggil tool lagi."})
+                        try:
+                            final_msg, final_usage = call_llm(cfg, messages, hook_mgr=hook_mgr)
+                            final_content = final_msg.get("content") or "(tidak ada jawaban)"
+                            tui.add_assistant_message(final_content)
+                            if final_usage:
+                                print_token_usage(final_usage, total_usage, model=cfg.get("model"))
+                        except:
+                            pass
+                        break
+
+                    tool_results = run_tool_calls(msg["tool_calls"], hook_mgr=hook_mgr, tui=tui)
+                    messages.extend(tool_results)
+
+                    # Kompresi lagi jika perlu
+                    if len(messages) > MAX_CONTEXT_MESSAGES:
+                        compressed = compress_messages(messages, cfg=cfg)
+
+                    continue  # kirim hasil tool kembali ke LLM
+
+                # Tidak ada tool call -> ini jawaban final.
+                content = msg.get("content") or "(tidak ada jawaban)"
+                tui.add_assistant_message(content)
+                # Tampilkan token usage untuk response final
                 if usage:
                     is_compressed = len(messages) > MAX_CONTEXT_MESSAGES
                     print_token_usage(usage, total_usage, {"compressed": is_compressed}, model=cfg.get("model"))
-
-                # Cek apakah tool call sudah terlalu banyak
-                if tool_call_count >= MAX_TOOL_CALLS:
-                    tui.add_info(f"{tool_call_count} tool calls dilakukan, memberikan jawaban final...")
-                    # Minta LLM untuk memberikan jawaban final
-                    messages.append({"role": "user", "content": "Berikan jawaban final sekarang, jangan panggil tool lagi."})
-                    try:
-                        final_msg, final_usage = call_llm(cfg, messages, hook_mgr=hook_mgr)
-                        final_content = final_msg.get("content") or "(tidak ada jawaban)"
-                        tui.add_assistant_message(final_content)
-                        if final_usage:
-                            print_token_usage(final_usage, total_usage, model=cfg.get("model"))
-                    except:
-                        pass
-                    break
-
-                tool_results = run_tool_calls(msg["tool_calls"], hook_mgr=hook_mgr, tui=tui)
-                messages.extend(tool_results)
-
-                # Kompresi lagi jika perlu
-                if len(messages) > MAX_CONTEXT_MESSAGES:
-                    compressed = compress_messages(messages, cfg=cfg)
-
-                continue  # kirim hasil tool kembali ke LLM
-
-            # Tidak ada tool call -> ini jawaban final.
-            content = msg.get("content") or "(tidak ada jawaban)"
-            tui.add_assistant_message(content)
-            # Tampilkan token usage untuk response final
-            if usage:
-                is_compressed = len(messages) > MAX_CONTEXT_MESSAGES
-                print_token_usage(usage, total_usage, {"compressed": is_compressed}, model=cfg.get("model"))
-            break
-        else:
-            tui.add_info(f"Selesai setelah {MAX_TOOL_CALLS} tool calls")
+                break
+            else:
+                tui.add_info(f"Selesai setelah {MAX_TOOL_CALLS} tool calls")
 
     finally:
         # Cleanup TUI
