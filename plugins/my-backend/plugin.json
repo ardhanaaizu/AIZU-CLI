@@ -1,0 +1,8 @@
+{
+  "name": "my-backend",
+  "version": "1.0.0",
+  "description": "Custom backend plugin untuk AIZU-CLI",
+  "author": "AIZU-CLI",
+  "type": "backend",
+  "entry": "main.py"
+}

@@ -1,0 +1,8 @@
+{
+  "name": "my-command",
+  "version": "1.0.0",
+  "description": "Custom command plugin untuk AIZU-CLI",
+  "author": "AIZU-CLI",
+  "type": "command",
+  "entry": "main.py"
+}

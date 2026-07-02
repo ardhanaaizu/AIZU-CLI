@@ -1,0 +1,8 @@
+{
+  "name": "brave-search",
+  "version": "1.0.0",
+  "description": "Web search using Brave Search API",
+  "author": "AIZU-CLI",
+  "type": "tool",
+  "entry": "main.py"
+}

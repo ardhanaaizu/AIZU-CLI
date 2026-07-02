@@ -1,0 +1,8 @@
+{
+  "name": "calculator",
+  "version": "1.0.0",
+  "description": "Calculator tool plugin untuk AIZU-CLI",
+  "author": "AIZU-CLI",
+  "type": "tool",
+  "entry": "main.py"
+}

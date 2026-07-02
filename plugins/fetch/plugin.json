@@ -1,0 +1,8 @@
+{
+  "name": "fetch",
+  "version": "1.0.0",
+  "description": "Fetch and extract content from URLs",
+  "author": "AIZU-CLI",
+  "type": "tool",
+  "entry": "main.py"
+}

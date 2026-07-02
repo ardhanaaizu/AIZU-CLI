@@ -1,0 +1,8 @@
+{
+  "name": "filesystem",
+  "version": "1.0.0",
+  "description": "Filesystem operations - baca/tulis file dengan aman",
+  "author": "AIZU-CLI",
+  "type": "tool",
+  "entry": "main.py"
+}

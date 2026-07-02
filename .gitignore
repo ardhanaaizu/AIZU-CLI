@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 config.json
+test.txt
+test2.txt
+*.run
+*.bak
+*.tmp
+.aizu/
+mcp.json

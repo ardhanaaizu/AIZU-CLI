@@ -1,0 +1,8 @@
+{
+  "name": "github",
+  "version": "1.0.0",
+  "description": "GitHub API integration - repos, issues, PRs, and more",
+  "author": "AIZU-CLI",
+  "type": "tool",
+  "entry": "main.py"
+}

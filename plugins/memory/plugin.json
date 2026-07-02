@@ -1,0 +1,8 @@
+{
+  "name": "memory",
+  "version": "1.0.0",
+  "description": "Persistent memory system for AIZU-CLI",
+  "author": "AIZU-CLI",
+  "type": "tool",
+  "entry": "main.py"
+}
