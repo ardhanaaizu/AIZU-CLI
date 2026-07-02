@@ -35,6 +35,9 @@ import tools
 from plugins import PluginManager, HookManager, SubAgent, SpecializedAgent, BackgroundAgentManager, AGENT_TYPES, list_plugins
 from tui import AizuTUI, StreamingTUI, Terminal, Colors, ThinkingIndicator
 from tasks import TaskManager, get_task_manager
+from memory import get_memory_manager, create_memory_tools
+from skills import get_skill_manager
+from scheduler import get_scheduler, parse_cron_shortcut
 
 
 # ---------------------------------------------------------------------------
@@ -218,8 +221,12 @@ SYSTEM_PROMPT = (
     "🔧 Git: git_status, git_log, git_diff, git_add, git_commit, git_push, git_pull, git_branch, git_checkout"
     "\n"
     "💻 Shell: run_shell (jalankan perintah terminal)"
+    "\n"
+    "🧠 Memory: memory_save, memory_search, memory_list, memory_get, memory_delete"
     "\n\n"
     "FITUR TAMBAHAN:"
+    "\n"
+    "- Memory system: Simpan fakta/preferensi user secara persisten. Gunakan memory_save untuk simpan, memory_search untuk recall."
     "\n"
     "- Plugin system: Tool, backend, mode, dan command baru bisa ditambah via plugin"
     "\n"
@@ -232,6 +239,10 @@ SYSTEM_PROMPT = (
     "- Plan mode: /plan untuk masuk mode eksplorasi sebelum implementasi"
     "\n"
     "- Task management: /tasks untuk lihat, buat, dan update task"
+    "\n"
+    "- Skills: /skill <name> untuk invoke reusable prompt templates"
+    "\n"
+    "- Scheduler: /schedule untuk set tugas terjadwal (cron)"
     "\n"
     "- Hooks: Lifecycle hooks tersedia untuk integrasi plugin"
     "\n\n"
@@ -252,6 +263,8 @@ SYSTEM_PROMPT = (
     "7. Bila ditanya sesuatu yang butuh riset, cari dulu di internet."
     "\n"
     "8. Untuk tugas kompleks, gunakan plan mode (/plan) untuk eksplorasi dulu sebelum implementasi."
+    "\n"
+    "9. Simpan fakta penting tentang user ke memory (memory_save) agar bisa recall nanti."
     "\n\n"
     "PENTING - JANGAN LOOP:"
     "\n"
@@ -864,13 +877,20 @@ SLASH_HELP = """Perintah yang tersedia:
   /tasks               lihat task list
   /tasks create <desc> buat task baru
   /tasks update <id> <status> update task status
+  /memory              lihat/simpan/cari memory
+  /memory save <name> <content> simpan memory
+  /memory search <query> cari memory
+  /skill <name> [args] invoke skill template
+  /schedule            lihat/tambah scheduled tasks
+  /schedule add <cron> <prompt> tambah scheduled task
   /keluar              keluar dari agent
 
 Tool yang tersedia:
   File    : read_file, write_file, edit_file, edit_file_improved, list_dir, search_files, glob_files, grep_content, read_file_lines
   Web     : web_search, web_fetch
   Git     : git_status, git_log, git_diff, git_add, git_commit, git_push, git_pull, git_branch, git_checkout
-  Shell   : run_shell"""
+  Shell   : run_shell
+  Memory  : memory_save, memory_search, memory_list, memory_get, memory_delete"""
 
 
 # Daftar slash command untuk autocomplete (nama, keterangan singkat).
@@ -897,6 +917,9 @@ COMMANDS = [
     ("/agents", "lihat background agents"),
     ("/plan", "masuk/keluar plan mode"),
     ("/tasks", "lihat/kelola task list"),
+    ("/memory", "kelola persistent memory"),
+    ("/skill", "invoke skill template"),
+    ("/schedule", "kelola scheduled tasks"),
     ("/reset", "hapus riwayat percakapan"),
     ("/keluar", "keluar dari agent"),
 ]
@@ -1318,6 +1341,151 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None):
                 print(f"  Task #{task_id} tidak ditemukan")
         else:
             print("  Pakai: /tasks [create|update|delete] ...")
+    elif cmd == "/memory":
+        # Memory management
+        if not arg:
+            # List memories
+            memories = memory_mgr.list_all()
+            if not memories:
+                print("  Tidak ada memory tersimpan.")
+            else:
+                print(f"\033[36mMemory ({len(memories)}):\033[0m")
+                for m in memories[:20]:
+                    name = m.get('name', 'unknown')
+                    mem_type = m.get('type', 'project')
+                    desc = m.get('description', '')[:50]
+                    print(f"  [{mem_type}] {name} — {desc}")
+                print("\n  Pakai:")
+                print("    /memory save <name> <content>  — simpan memory")
+                print("    /memory get <name>  — lihat detail memory")
+                print("    /memory search <query>  — cari memory")
+                print("    /memory delete <name>  — hapus memory")
+        elif arg.startswith("save "):
+            parts = arg[5:].strip().split(maxsplit=1)
+            if len(parts) == 2:
+                name, content = parts
+                try:
+                    filepath = memory_mgr.save(name, content)
+                    print(f"  \033[32mMemory '{name}' tersimpan\033[0m")
+                except Exception as e:
+                    print(f"  \033[31mError: {e}\033[0m")
+            else:
+                print("  Pakai: /memory save <name> <content>")
+        elif arg.startswith("get "):
+            name = arg[4:].strip()
+            memory = memory_mgr.get(name)
+            if memory:
+                print(f"\033[36mMemory: {memory.get('name')}\033[0m")
+                print(f"  Type: {memory.get('type', 'project')}")
+                print(f"  Description: {memory.get('description', '-')}")
+                print(f"\n{memory.get('content', '')}")
+            else:
+                print(f"  Memory '{name}' tidak ditemukan")
+        elif arg.startswith("search "):
+            query = arg[7:].strip()
+            results = memory_mgr.search(query)
+            if results:
+                print(f"\033[36mSearch results for '{query}':\033[0m")
+                for r in results:
+                    name = r.get('name', 'unknown')
+                    desc = r.get('description', '')[:50]
+                    print(f"  [{r.get('type', 'project')}] {name} — {desc}")
+            else:
+                print(f"  Tidak ditemukan memory untuk: {query}")
+        elif arg.startswith("delete "):
+            name = arg[7:].strip()
+            if memory_mgr.delete(name):
+                print(f"  \033[32mMemory '{name}' dihapus\033[0m")
+            else:
+                print(f"  Memory '{name}' tidak ditemukan")
+        else:
+            print("  Pakai: /memory [save|get|search|delete] ...")
+    elif cmd == "/skill":
+        # Skill invocation
+        if not arg:
+            # List skills
+            skills = skill_mgr.list_all()
+            if not skills:
+                print("  Tidak ada skills tersedia.")
+            else:
+                print(f"\033[36mSkills ({len(skills)}):\033[0m")
+                for s in skills:
+                    name = s.get('name', 'unknown')
+                    desc = s.get('description', '')[:50]
+                    source = s.get('source', 'custom')
+                    print(f"  [{source}] {name} — {desc}")
+                print("\n  Pakai: /skill <name> [args]")
+                print("  Contoh: /skill review-code file=app.py")
+        else:
+            # Parse skill name and args
+            parts = arg.split(maxsplit=1)
+            skill_name = parts[0]
+            skill_args = {}
+
+            if len(parts) > 1:
+                # Parse key=value pairs
+                for pair in re.findall(r'(\w+)=(\S+)', parts[1]):
+                    skill_args[pair[0]] = pair[1]
+
+            # Invoke skill
+            rendered = skill_mgr.invoke(skill_name, skill_args)
+            if rendered:
+                # Treat as user message
+                messages.append({"role": "user", "content": rendered})
+                print(f"  \033[32mSkill '{skill_name}' invoked\033[0m")
+                # Will be processed in next loop iteration
+            else:
+                print(f"  Skill '{skill_name}' tidak ditemukan")
+    elif cmd == "/schedule":
+        # Scheduler management
+        if not arg:
+            # List scheduled tasks
+            print(scheduler.format_list())
+            print("\n  Pakai:")
+            print("    /schedule add <cron> <prompt>  — tambah task")
+            print("    /schedule remove <id>  — hapus task")
+            print("    /schedule enable <id>  — aktifkan task")
+            print("    /schedule disable <id>  — nonaktifkan task")
+            print("\n  Cron shortcuts: @daily, @hourly, @every 5m, @every 2h")
+            print("  Cron format: minute hour day month weekday")
+            print("  Contoh: /schedule add @daily Cek status server")
+        elif arg.startswith("add "):
+            task_def = arg[4:].strip()
+            # Parse: first word is cron, rest is prompt
+            parts = task_def.split(maxsplit=1)
+            if len(parts) == 2:
+                cron_expr, prompt = parts
+                try:
+                    # Handle shortcuts
+                    cron_expr = parse_cron_shortcut(cron_expr)
+                    task = scheduler.add(cron_expr, prompt)
+                    print(f"  \033[32mTask ditambahkan: {task.id}\033[0m")
+                    print(f"  Cron: {cron_expr}")
+                    print(f"  Prompt: {prompt}")
+                except ValueError as e:
+                    print(f"  \033[31mError: {e}\033[0m")
+            else:
+                print("  Pakai: /schedule add <cron> <prompt>")
+        elif arg.startswith("remove "):
+            task_id = arg[7:].strip()
+            if scheduler.remove(task_id):
+                print(f"  \033[32mTask {task_id} dihapus\033[0m")
+            else:
+                print(f"  Task {task_id} tidak ditemukan")
+        elif arg.startswith("enable "):
+            task_id = arg[7:].strip()
+            if scheduler.enable(task_id):
+                print(f"  \033[32mTask {task_id} diaktifkan\033[0m")
+            else:
+                print(f"  Task {task_id} tidak ditemukan")
+        elif arg.startswith("disable "):
+            task_id = arg[8:].strip()
+            if scheduler.disable(task_id):
+                print(f"  \033[32mTask {task_id} dinonaktifkan\033[0m")
+            else:
+                print(f"  Task {task_id} tidak ditemukan")
+        else:
+            print("  Pakai: /schedule [add|remove|enable|disable] ...")
     else:
         # Cek plugin commands
         if plugin_mgr:
@@ -1846,6 +2014,20 @@ def chat_loop(cfg):
     plugin_mgr.register_backends(PRESETS)
     plugin_mgr.register_modes(MODES)
 
+    # Inisialisasi Memory Manager dan register memory tools
+    memory_mgr = get_memory_manager()
+    memory_tools = create_memory_tools(memory_mgr)
+    for name, (func, schema) in memory_tools.items():
+        if name not in tools.REGISTRY:
+            tools.REGISTRY[name] = func
+            tools.SCHEMAS.append(schema)
+
+    # Inisialisasi Skill Manager
+    skill_mgr = get_skill_manager()
+
+    # Inisialisasi Scheduler
+    scheduler = get_scheduler()
+
     # Startup hook
     hook_mgr.emit('on_startup')
 
@@ -1910,6 +2092,15 @@ def chat_loop(cfg):
 
             messages.append({"role": "user", "content": user})
             tui.add_user_message(user)
+
+            # Memory auto-recall: inject relevant memories
+            memory_context = memory_mgr.recall(user, limit=3)
+            if memory_context:
+                # Inject as system-level context before LLM call
+                messages.insert(-1, {
+                    "role": "system",
+                    "content": memory_context
+                })
 
         # Kompresi pesan untuk hemat token (prompt caching)
         if len(messages) > MAX_CONTEXT_MESSAGES:
