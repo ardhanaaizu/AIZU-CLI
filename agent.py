@@ -33,12 +33,22 @@ except ImportError:           # Windows / lingkungan tanpa termios
 
 import tools
 from plugins import PluginManager, HookManager, SubAgent, SpecializedAgent, BackgroundAgentManager, AGENT_TYPES, list_plugins
-from tui import AizuTUI, StreamingTUI, Colors
+from tui import AizuTUI, StreamingTUI, Colors, ResponsiveTUI, ClaudeStyleTUI
 from tasks import TaskManager, get_task_manager
 from memory import get_memory_manager, create_memory_tools
 from skills import get_skill_manager
 from scheduler import get_scheduler, parse_cron_shortcut
+from user_data import get_user_data_manager, FIELD_LABELS, DOKUMEN_LABELS
 
+# ---------------------------------------------------------------------------
+# Fix encoding untuk Windows (cp1252 → utf-8)
+# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Loading animation
@@ -156,17 +166,8 @@ def show_tool_animation(tool_name, args):
         anim = LoadingAnimation(WORKING_FRAMES)
     elif "edit" in tool_name:
         anim = LoadingAnimation(CODING_FRAMES)
-        # Tampilkan info file yang diedit
-        path = args.get("path", "")
-        if path:
-            anim.stop(f"  \033[32m✎\033[0m Editing \033[36m{path}\033[0m")
-            anim.start()
     elif "write" in tool_name:
         anim = LoadingAnimation(CODING_FRAMES)
-        path = args.get("path", "")
-        if path:
-            anim.stop(f"  \033[32m✎\033[0m Writing \033[36m{path}\033[0m")
-            anim.start()
     else:
         anim = LoadingAnimation(TOOL_FRAMES)
     anim.start()
@@ -385,6 +386,9 @@ TOOL_PERMISSIONS = {
 # Default permission for unknown tools
 DEFAULT_TOOL_PERMISSION = "auto"
 
+# Session-level "always allow" — cleared when session ends
+SESSION_ALWAYS_ALLOW = set()
+
 # ---------------------------------------------------------------------------
 # Banner ASCII ala hacker.
 # ---------------------------------------------------------------------------
@@ -528,7 +532,7 @@ def list_sessions():
                     "message_count": data.get("message_count", 0),
                     "file": filepath
                 })
-            except:
+            except Exception:
                 pass
 
     # Sort by created (newest first)
@@ -554,7 +558,7 @@ def delete_session(session_name):
         try:
             os.remove(session_file)
             return True
-        except:
+        except Exception:
             return False
     return False
 
@@ -585,25 +589,187 @@ def set_plan_content(content):
     _plan_content = content
 
 
-def compress_messages(messages, max_messages=MAX_CONTEXT_MESSAGES, cfg=None):
-    """Kompresi pesan untuk hemat token.
+def compress_messages(messages, max_messages=MAX_CONTEXT_MESSAGES, cfg=None,
+                      max_tokens=8000, strategy="smart"):
+    """Kompresi pesan untuk hemat token dengan smart context management.
 
     Strategi:
-    - Simpan system prompt selalu
-    - Simpan 5 pesan terakhir (recent context)
-    - Pesan lama di-summary menggunakan LLM (jika cfg tersedia)
-    - Fallback: truncate ke 100 karakter per pesan
+    - SMART: Sliding window dengan importance scoring (default)
+    - SIMPLE: Simpan 5 pesan terakhir + summary
+    - AGGRESSIVE: Hanya system prompt + 3 pesan terakhir
+
+    Args:
+        messages: List of message dicts
+        max_messages: Maximum messages sebelum kompresi (legacy)
+        cfg: Config dict dengan API key
+        max_tokens: Target maximum tokens (estimated)
+        strategy: Kompresi strategy (smart, simple, aggressive)
+
+    Returns:
+        list: Compressed messages
     """
-    if len(messages) <= max_messages:
+    # Hitung token saat ini
+    current_tokens = count_tokens_approx(str(messages))
+
+    # Jika masih dalam budget, return as-is
+    if current_tokens <= max_tokens:
         return messages
 
     # Pisahkan system prompt
     system_msg = messages[0] if messages[0]["role"] == "system" else None
     other_msgs = messages[1:] if system_msg else messages
 
-    # Simpan 5 pesan terakhir
-    recent = other_msgs[-5:]
-    old = other_msgs[:-5]
+    if strategy == "smart":
+        compressed = _smart_compress(other_msgs, max_tokens, cfg)
+    elif strategy == "aggressive":
+        compressed = _aggressive_compress(other_msgs)
+    else:
+        compressed = _simple_compress(other_msgs, cfg)
+
+    # Tambah system prompt di awal
+    if system_msg:
+        compressed = [system_msg] + compressed
+
+    return compressed
+
+
+def _smart_compress(messages, max_tokens, cfg=None):
+    """Smart compression dengan importance scoring.
+
+    Strategi:
+    1. Hitung importance score untuk setiap message
+    2. Retain messages dengan score tinggi
+    3. Summarize messages dengan score rendah
+    4. Preserve tool call/result pairs
+    5. Selalu retain 3 pesan terakhir
+    """
+    if len(messages) <= 3:
+        return messages
+
+    # Retain 3 pesan terakhir
+    recent = messages[-3:]
+    old = messages[:-3]
+
+    if not old:
+        return messages
+
+    # Hitung importance score untuk setiap message
+    scored_messages = []
+    for i, msg in enumerate(old):
+        score = _calculate_importance(msg, i, len(old))
+        scored_messages.append((score, msg))
+
+    # Sort berdasarkan score (tertinggi dulu)
+    scored_messages.sort(key=lambda x: x[0], reverse=True)
+
+    # Ambil messages dengan score tinggi sampai budget terpenuhi
+    retained = []
+    retained_tokens = count_tokens_approx(str(recent))
+
+    for score, msg in scored_messages:
+        msg_tokens = count_tokens_approx(str(msg))
+        if retained_tokens + msg_tokens <= max_tokens * 0.6:  # 60% untuk retained
+            retained.append(msg)
+            retained_tokens += msg_tokens
+
+    # Sort retained berdasarkan urutan asli
+    retained.sort(key=lambda x: messages.index(x))
+
+    # Summarize messages yang tidak di-retain
+    not_retained = [msg for _, msg in scored_messages if msg not in retained]
+    summary = None
+
+    if not_retained and cfg and cfg.get("api_key"):
+        summary = _summarize_with_llm(not_retained, cfg)
+
+    if not summary and not_retained:
+        # Fallback: simple summary
+        summary_parts = []
+        for msg in not_retained[-5:]:  # Max 5 messages untuk summary
+            role = msg.get("role", "")
+            content = msg.get("content", "")[:100]
+            if role == "user":
+                summary_parts.append(f"User: {content}")
+            elif role == "assistant":
+                summary_parts.append(f"Assistant: {content}")
+        if summary_parts:
+            summary = "📝 Konteks sebelumnya:\n" + "\n".join(summary_parts)
+
+    # Build result
+    result = []
+    if summary:
+        result.append({"role": "user", "content": summary})
+    result.extend(retained)
+    result.extend(recent)
+
+    return result
+
+
+def _calculate_importance(msg, position, total):
+    """Hitung importance score untuk sebuah message.
+
+    Score factors:
+    - Recency: Pesan lebih baru = lebih penting
+    - Role: User messages sedikit lebih penting
+    - Content length: Pesan panjang biasanya lebih informatif
+    - Tool calls: Tool call/result pairs penting untuk konteks
+    - Keywords: Pesan dengan kata kunci teknis lebih penting
+    """
+    score = 0.0
+    role = msg.get("role", "")
+    content = msg.get("content", "")
+
+    # Recency score (0-40 points)
+    recency = (position / total) * 40
+    score += recency
+
+    # Role score (0-15 points)
+    if role == "user":
+        score += 15
+    elif role == "assistant":
+        score += 10
+    elif role == "tool":
+        score += 12  # Tool results penting
+
+    # Content length score (0-20 points)
+    content_len = len(content)
+    if content_len > 500:
+        score += 20
+    elif content_len > 200:
+        score += 15
+    elif content_len > 100:
+        score += 10
+    elif content_len > 50:
+        score += 5
+
+    # Tool calls bonus (20 points)
+    if msg.get("tool_calls"):
+        score += 20
+
+    # Technical keywords bonus (0-15 points)
+    technical_keywords = [
+        'error', 'bug', 'fix', 'function', 'class', 'import',
+        'def ', 'return', 'if ', 'for ', 'while ', 'try:',
+        'except', 'raise', 'with ', 'as ', 'from ', 'import',
+        'file', 'path', 'directory', 'git', 'commit', 'push',
+        'test', 'debug', 'config', 'api', 'key', 'token'
+    ]
+    content_lower = content.lower()
+    keyword_count = sum(1 for kw in technical_keywords if kw in content_lower)
+    score += min(keyword_count * 3, 15)  # Max 15 points
+
+    return score
+
+
+def _aggressive_compress(messages):
+    """Aggressive compression: hanya 3 pesan terakhir."""
+    return messages[-3:]
+
+
+def _simple_compress(messages, cfg=None):
+    """Simple compression: 5 pesan terakhir + summary."""
+    recent = messages[-5:]
+    old = messages[:-5]
 
     if not old:
         return messages
@@ -626,13 +792,7 @@ def compress_messages(messages, max_messages=MAX_CONTEXT_MESSAGES, cfg=None):
         summary_text = "Ringkasan percakapan sebelumnya:\n" + "\n".join(summary_parts[-10:])
 
     summary_msg = {"role": "user", "content": summary_text}
-    compressed = [summary_msg] + recent
-
-    # Tambah system prompt di awal
-    if system_msg:
-        compressed = [system_msg] + compressed
-
-    return compressed
+    return [summary_msg] + recent
 
 
 def _summarize_with_llm(messages, cfg):
@@ -920,6 +1080,7 @@ COMMANDS = [
     ("/memory", "kelola persistent memory"),
     ("/skill", "invoke skill template"),
     ("/schedule", "kelola scheduled tasks"),
+    ("/data-user", "kelola data profil user"),
     ("/reset", "hapus riwayat percakapan"),
     ("/keluar", "keluar dari agent"),
 ]
@@ -1019,7 +1180,7 @@ def prompt_with_completion(prompt_text, visible_len):
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None):
+def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None, memory_mgr=None, skill_mgr=None, scheduler=None):
     """Tangani perintah slash. Return True jika program harus berhenti.
 
     Args:
@@ -1050,112 +1211,112 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None):
     arg = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd in ("/keluar", "/exit", "/quit"):
-        print("Daah!")
+        tui_print("Daah!")
         return True
     elif cmd in ("/help", "/?"):
-        print(SLASH_HELP)
+        tui_print(SLASH_HELP)
         # Tampilkan plugin commands jika ada
         if plugin_mgr:
             plugin_commands = plugin_mgr.get_all_commands()
             if plugin_commands:
-                print("\n\033[36mPlugin Commands:\033[0m")
+                tui_print("\n\033[36mPlugin Commands:\033[0m")
                 for name in sorted(plugin_commands.keys()):
-                    print(f"  {name}")
+                    tui_print(f"  {name}")
     elif cmd == "/reset":
         del messages[1:]
-        print("[riwayat dihapus]")
+        tui_print("[riwayat dihapus]")
     elif cmd == "/config":
         need = PRESETS[cfg["backend"]]["needs_key"]
-        print(f"  backend : {cfg['backend']}")
-        print(f"  model   : {cfg['model']}")
-        print(f"  mode    : {cfg.get('mode', DEFAULT_MODE)}")
-        print(f"  base_url: {cfg['base_url']}")
-        print(f"  api_key : {mask_key(cfg['api_key'])}" + ("" if need else "  (tidak diperlukan)"))
+        tui_print(f"  backend : {cfg['backend']}")
+        tui_print(f"  model   : {cfg['model']}")
+        tui_print(f"  mode    : {cfg.get('mode', DEFAULT_MODE)}")
+        tui_print(f"  base_url: {cfg['base_url']}")
+        tui_print(f"  api_key : {mask_key(cfg['api_key'])}" + ("" if need else "  (tidak diperlukan)"))
         # Tampilkan info plugins
         if plugin_mgr:
-            print(f"  plugins : {len(plugin_mgr.plugins)} loaded")
+            tui_print(f"  plugins : {len(plugin_mgr.plugins)} loaded")
     elif cmd == "/backend":
         if not arg:
-            print("  Pakai: /backend <nama>. Pilihan: " + ", ".join(PRESETS))
+            tui_print("  Pakai: /backend <nama>. Pilihan: " + ", ".join(PRESETS))
         elif arg.lower() == "custom":
             setup_custom_provider(cfg)
         else:
-            print("  " + apply_backend(cfg, arg))
+            tui_print("  " + apply_backend(cfg, arg))
     elif cmd == "/provider":
         setup_custom_provider(cfg)
     elif cmd in ("/providers", "/list"):
         choose_saved_provider(cfg)
     elif cmd == "/mode":
         if not arg:
-            print("  Mode tersedia:")
+            tui_print("  Mode tersedia:")
             for name, info in MODES.items():
                 tanda = " (aktif)" if name == cfg.get("mode") else ""
-                print(f"    {name:<9} - {info['desc']}{tanda}")
-            print("  Pakai: /mode <nama>")
+                tui_print(f"    {name:<9} - {info['desc']}{tanda}")
+            tui_print("  Pakai: /mode <nama>")
         elif arg in MODES:
             cfg["mode"] = arg
             # Perbarui system prompt pada riwayat aktif.
             if messages:
                 messages[0] = {"role": "system", "content": build_system_prompt(arg)}
-            print(f"  Mode -> {arg} ({MODES[arg]['desc']})")
+            tui_print(f"  Mode -> {arg} ({MODES[arg]['desc']})")
         else:
-            print(f"  Mode tidak dikenal. Pilihan: {', '.join(MODES)}")
+            tui_print(f"  Mode tidak dikenal. Pilihan: {', '.join(MODES)}")
     elif cmd == "/models":
         if PRESETS[cfg["backend"]]["needs_key"] and not cfg["api_key"]:
-            print("  [info] atur API key dulu dengan /key")
+            tui_print("  [info] atur API key dulu dengan /key", "info")
         else:
-            print("  \033[33mMengambil daftar model...\033[0m")
+            tui_print("  Mengambil daftar model...", "info")
             ok, hasil = fetch_models(cfg["base_url"], cfg["api_key"])
             if not ok:
-                print(f"  [error] {hasil}")
+                tui_print(f"  [error] {hasil}", "error")
             else:
                 if arg:
                     hasil = [m for m in hasil if arg.lower() in m.lower()] or hasil
                 m = choose_model_interactive(cfg, hasil)
                 if m:
                     cfg["model"] = m
-                    print(f"  Model -> {m}")
+                    tui_print(f"  Model -> {m}", "success")
     elif cmd == "/key":
         if arg:
             cfg["api_key"] = arg
-            print(f"  API key diatur: {mask_key(arg)}")
+            tui_print(f"  API key diatur: {mask_key(arg)}", "success")
         else:
-            print("  Pakai: /key <api-key>")
+            tui_print("  Pakai: /key <api-key>")
     elif cmd == "/model":
         if arg:
             cfg["model"] = arg
-            print(f"  Model -> {arg}")
+            tui_print(f"  Model -> {arg}", "success")
         else:
-            print("  Pakai: /model <nama>")
+            tui_print("  Pakai: /model <nama>")
     elif cmd == "/url":
         if arg:
             cfg["base_url"] = arg.rstrip("/")
-            print(f"  base_url -> {cfg['base_url']}")
+            tui_print(f"  base_url -> {cfg['base_url']}", "success")
         else:
-            print("  Pakai: /url <base-url>")
+            tui_print("  Pakai: /url <base-url>")
     elif cmd == "/save":
-        print("  " + save_config(cfg))
+        tui_print("  " + save_config(cfg), "success")
     elif cmd == "/tools":
         for s in tools.SCHEMAS:
             fn = s["function"]
-            print(f"  {fn['name']:<12} {fn['description']}")
+            tui_print(f"  {fn['name']:<12} {fn['description']}")
     elif cmd == "/sessions":
         # List semua sessions
         sessions = list_sessions()
         if not sessions:
-            print("  Tidak ada session tersimpan.")
+            tui_print("  Tidak ada session tersimpan.")
         else:
-            print(f"\033[36mSessions ({len(sessions)}):\033[0m")
+            tui_print(f"Sessions ({len(sessions)}):", "info")
             for i, s in enumerate(sessions, 1):
                 created = s.get('created', 'unknown')[:19]
                 msgs = s.get('message_count', 0)
-                print(f"  {i:>2}. {s['name']:<20} {created} ({msgs} msgs)")
-            print("  Gunakan: /resume <nomor atau nama>")
+                tui_print(f"  {i:>2}. {s['name']:<20} {created} ({msgs} msgs)")
+            tui_print("  Gunakan: /resume <nomor atau nama>")
     elif cmd == "/resume":
         # Resume session
         if not arg:
-            print("  Pakai: /resume <nomor atau nama session>")
-            print("  Lihat /sessions untuk daftar")
+            tui_print("  Pakai: /resume <nomor atau nama session>")
+            tui_print("  Lihat /sessions untuk daftar")
         else:
             sessions = list_sessions()
             # Coba sebagai nomor
@@ -1168,7 +1329,7 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None):
                         # Clear current messages dan replace
                         messages.clear()
                         messages.extend(loaded_messages)
-                        print(f"  \033[32mSession '{sessions[idx]['name']}' loaded ({len(loaded_messages)} msgs)\033[0m")
+                        tui_print(f"  Session '{sessions[idx]['name']}' loaded ({len(loaded_messages)} msgs)", "success")
                         return False
             except ValueError:
                 pass
@@ -1178,126 +1339,125 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None):
             if loaded_messages:
                 messages.clear()
                 messages.extend(loaded_messages)
-                print(f"  \033[32mSession '{arg}' loaded ({len(loaded_messages)} msgs)\033[0m")
+                tui_print(f"  Session '{arg}' loaded ({len(loaded_messages)} msgs)", "success")
             else:
-                print(f"  \033[31mSession '{arg}' tidak ditemukan\033[0m")
+                tui_print(f"  Session '{arg}' tidak ditemukan", "error")
     elif cmd == "/save-session":
         # Simpan session saat ini
         if not arg:
             arg = datetime.now().strftime("%Y%m%d_%H%M%S")
         session_file = save_session(messages, arg)
-        print(f"  \033[32mSession saved: {arg}\033[0m")
-        print(f"  File: {session_file}")
+        tui_print(f"  Session saved: {arg}", "success")
+        tui_print(f"  File: {session_file}")
     elif cmd == "/delete-session":
         # Hapus session
         if not arg:
-            print("  Pakai: /delete-session <nama session>")
+            tui_print("  Pakai: /delete-session <nama session>")
         else:
             if delete_session(arg):
-                print(f"  \033[32mSession '{arg}' deleted\033[0m")
+                tui_print(f"  Session '{arg}' deleted", "success")
             else:
-                print(f"  \033[31mSession '{arg}' tidak ditemukan\033[0m")
+                tui_print(f"  Session '{arg}' tidak ditemukan", "error")
     elif cmd == "/permissions":
         # Manage tool permissions
         if not arg:
             # List permissions
-            print("\033[36mTool Permissions:\033[0m")
-            print("  auto  = Execute tanpa tanya")
-            print("  ask   = Tanya dulu sebelum execute")
-            print("  deny  = Blokir total")
-            print()
+            tui_print("Tool Permissions:", "info")
+            tui_print("  auto  = Execute tanpa tanya")
+            tui_print("  ask   = Tanya dulu sebelum execute")
+            tui_print("  deny  = Blokir total")
+            tui_print("")
             for perm_type in ["auto", "ask", "deny"]:
                 tools_list = [t for t, p in TOOL_PERMISSIONS.items() if p == perm_type]
                 if tools_list:
-                    color = "32" if perm_type == "auto" else ("33" if perm_type == "ask" else "31")
-                    print(f"  \033[{color}m{perm_type}:\033[0m {', '.join(tools_list[:5])}")
+                    tui_print(f"  {perm_type}: {', '.join(tools_list[:5])}")
                     if len(tools_list) > 5:
-                        print(f"    ... and {len(tools_list) - 5} more")
-            print()
-            print("  Gunakan: /permissions <tool> <auto|ask|deny>")
+                        tui_print(f"    ... and {len(tools_list) - 5} more")
+            tui_print("")
+            tui_print("  Gunakan: /permissions <tool> <auto|ask|deny>")
         else:
             # Set permission
             parts = arg.split()
             if len(parts) != 2:
-                print("  Pakai: /permissions <tool> <auto|ask|deny>")
+                tui_print("  Pakai: /permissions <tool> <auto|ask|deny>")
             else:
                 tool_name, perm = parts
                 if perm not in ("auto", "ask", "deny"):
-                    print("  Permission harus: auto, ask, atau deny")
+                    tui_print("  Permission harus: auto, ask, atau deny", "error")
                 else:
                     update_tool_permission(tool_name, perm)
-                    print(f"  \033[32mPermission '{tool_name}' -> {perm}\033[0m")
+                    tui_print(f"  Permission '{tool_name}' -> {perm}", "success")
     elif cmd == "/plugins":
         # Tampilkan daftar plugin yang terinstall
         plugins = list_plugins()
         if not plugins:
-            print("  Tidak ada plugin terinstall.")
+            tui_print("  Tidak ada plugin terinstall.")
         else:
-            print(f"\033[36mPlugins ({len(plugins)}):\033[0m")
+            tui_print(f"Plugins ({len(plugins)}):", "info")
             for p in plugins:
                 loc = "local" if p.get('location') == 'local' else "user"
-                print(f"  {p['name']:<20} v{p.get('version', '?'):<8} [{loc}] {p.get('description', '')}")
+                tui_print(f"  {p['name']:<20} v{p.get('version', '?'):<8} [{loc}] {p.get('description', '')}")
     elif cmd == "/agent":
         # Sub-agent command
         if not arg:
-            print("  Pakai: /agent <task>")
-            print("         /agent --type <explore|code-reviewer|implementer> <task>")
-            print("         /agent --bg <task>")
-            print("  Contoh: /agent Buat function hello world di Python")
-            print("  Contoh: /agent --type explore Cari semua file Python")
-            print("  Contoh: /agent --bg Refactor kode di src/")
+            tui_print("  Pakai: /agent <task>")
+            tui_print("         /agent --type <explore|code-reviewer|implementer> <task>")
+            tui_print("         /agent --bg <task>")
+            tui_print("  Contoh: /agent Buat function hello world di Python")
+            tui_print("  Contoh: /agent --type explore Cari semua file Python")
+            tui_print("  Contoh: /agent --bg Refactor kode di src/")
         elif arg.startswith("--type "):
             # Specialized agent
             parts = arg[7:].strip().split(maxsplit=1)
             if len(parts) < 2:
-                print("  Pakai: /agent --type <explore|code-reviewer|implementer> <task>")
+                tui_print("  Pakai: /agent --type <explore|code-reviewer|implementer> <task>")
             else:
                 agent_type, task = parts
                 if agent_type not in AGENT_TYPES:
-                    print(f"  Tipe tidak dikenal: {agent_type}")
-                    print(f"  Tipe tersedia: {', '.join(AGENT_TYPES.keys())}")
+                    tui_print(f"  Tipe tidak dikenal: {agent_type}", "error")
+                    tui_print(f"  Tipe tersedia: {', '.join(AGENT_TYPES.keys())}")
                 else:
-                    print(f"  \033[33mMemulai {agent_type} agent...\033[0m")
+                    tui_print(f"  Memulai {agent_type} agent...", "info")
                     agent = SpecializedAgent(task, cfg, os.getcwd(), agent_type=agent_type, hook_mgr=hook_mgr)
                     result = agent.run()
-                    print(f"\n\033[36m{ASSISTANT_NAME}>\033[0m {result}")
+                    tui_print(f"{ASSISTANT_NAME}> {result}")
         elif arg.startswith("--bg "):
             # Background agent
             task = arg[5:].strip()
             if not task:
-                print("  Pakai: /agent --bg <task>")
+                tui_print("  Pakai: /agent --bg <task>")
             else:
                 # Initialize background manager if needed
                 if not hasattr(handle_slash, '_bg_manager'):
                     handle_slash._bg_manager = BackgroundAgentManager(cfg, os.getcwd(), hook_mgr)
                 agent_id = handle_slash._bg_manager.spawn(task)
-                print(f"  \033[32mBackground agent started: {agent_id}\033[0m")
-                print(f"  Cek status: /agents")
+                tui_print(f"  Background agent started: {agent_id}", "success")
+                tui_print(f"  Cek status: /agents")
         else:
-            print(f"  \033[33mMemulai sub-agent...\033[0m")
+            tui_print(f"  Memulai sub-agent...", "info")
             agent = SubAgent(arg, cfg, os.getcwd(), hook_mgr=hook_mgr)
             result = agent.run()
-            print(f"\n\033[36m{ASSISTANT_NAME}>\033[0m {result}")
+            tui_print(f"{ASSISTANT_NAME}> {result}")
     elif cmd == "/agents":
         # List background agents
         if not hasattr(handle_slash, '_bg_manager'):
-            print("  Tidak ada background agents.")
+            tui_print("  Tidak ada background agents.")
         else:
             agents_list = handle_slash._bg_manager.format_list()
-            print(f"\033[36mBackground Agents:\033[0m")
-            print(agents_list)
+            tui_print("Background Agents:", "info")
+            tui_print(agents_list)
     elif cmd == "/plan":
         # Plan mode toggle
         if is_plan_mode():
             set_plan_mode(False)
-            print("  \033[32mPlan mode OFF\033[0m — Sekarang bisa execute.")
+            tui_print("  Plan mode OFF — Sekarang bisa execute.", "success")
             if get_plan_content():
-                print(f"\n  Plan tersimpan:\n{get_plan_content()}")
+                tui_print(f"\n  Plan tersimpan:\n{get_plan_content()}")
         else:
             set_plan_mode(True)
-            print("  \033[33mPlan mode ON\033[0m — Hanya eksplorasi, tidak execute.")
-            print("  Gunakan tool read/search untuk eksplorasi kode.")
-            print("  Ketik /plan lagi untuk keluar dan mulai implementasi.")
+            tui_print("  Plan mode ON — Hanya eksplorasi, tidak execute.", "warning")
+            tui_print("  Gunakan tool read/search untuk eksplorasi kode.")
+            tui_print("  Ketik /plan lagi untuk keluar dan mulai implementasi.")
     elif cmd == "/tasks":
         # Task management
         task_mgr = get_task_manager()
@@ -1305,117 +1465,117 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None):
             # List tasks
             summary = task_mgr.format_summary()
             task_list = task_mgr.format_task_list()
-            print(f"\033[36m{summary}\033[0m")
-            print(task_list)
-            print("\n  Pakai:")
-            print("    /tasks create <deskripsi>  — buat task baru")
-            print("    /tasks update <id> <status> — update status (pending|in_progress|completed)")
-            print("    /tasks delete <id>  — hapus task")
+            tui_print(summary, "info")
+            tui_print(task_list)
+            tui_print("\n  Pakai:")
+            tui_print("    /tasks create <deskripsi>  — buat task baru")
+            tui_print("    /tasks update <id> <status> — update status (pending|in_progress|completed)")
+            tui_print("    /tasks delete <id>  — hapus task")
         elif arg.startswith("create "):
             desc = arg[7:].strip()
             if desc:
                 task = task_mgr.create(desc)
-                print(f"  \033[32mTask #{task['id']} dibuat: {desc}\033[0m")
+                tui_print(f"  Task #{task['id']} dibuat: {desc}", "success")
             else:
-                print("  Pakai: /tasks create <deskripsi>")
+                tui_print("  Pakai: /tasks create <deskripsi>")
         elif arg.startswith("update "):
             parts = arg[7:].strip().split(maxsplit=1)
             if len(parts) == 2:
                 task_id, status = parts
                 if status not in TaskManager.VALID_STATUSES:
-                    print(f"  Status tidak valid: {status}")
-                    print(f"  Status: {', '.join(TaskManager.VALID_STATUSES)}")
+                    tui_print(f"  Status tidak valid: {status}", "error")
+                    tui_print(f"  Status: {', '.join(TaskManager.VALID_STATUSES)}")
                 else:
                     task = task_mgr.update(task_id, status=status)
                     if task:
-                        print(f"  \033[32mTask #{task_id} -> {status}\033[0m")
+                        tui_print(f"  Task #{task_id} -> {status}", "success")
                     else:
-                        print(f"  Task #{task_id} tidak ditemukan")
+                        tui_print(f"  Task #{task_id} tidak ditemukan")
             else:
-                print("  Pakai: /tasks update <id> <pending|in_progress|completed>")
+                tui_print("  Pakai: /tasks update <id> <pending|in_progress|completed>")
         elif arg.startswith("delete "):
             task_id = arg[7:].strip()
             if task_mgr.delete(task_id):
-                print(f"  \033[33mTask #{task_id} dihapus\033[0m")
+                tui_print(f"  Task #{task_id} dihapus", "warning")
             else:
-                print(f"  Task #{task_id} tidak ditemukan")
+                tui_print(f"  Task #{task_id} tidak ditemukan")
         else:
-            print("  Pakai: /tasks [create|update|delete] ...")
+            tui_print("  Pakai: /tasks [create|update|delete] ...")
     elif cmd == "/memory":
         # Memory management
         if not arg:
             # List memories
             memories = memory_mgr.list_all()
             if not memories:
-                print("  Tidak ada memory tersimpan.")
+                tui_print("  Tidak ada memory tersimpan.")
             else:
-                print(f"\033[36mMemory ({len(memories)}):\033[0m")
+                tui_print(f"Memory ({len(memories)}):", "info")
                 for m in memories[:20]:
                     name = m.get('name', 'unknown')
                     mem_type = m.get('type', 'project')
                     desc = m.get('description', '')[:50]
-                    print(f"  [{mem_type}] {name} — {desc}")
-                print("\n  Pakai:")
-                print("    /memory save <name> <content>  — simpan memory")
-                print("    /memory get <name>  — lihat detail memory")
-                print("    /memory search <query>  — cari memory")
-                print("    /memory delete <name>  — hapus memory")
+                    tui_print(f"  [{mem_type}] {name} — {desc}")
+                tui_print("\n  Pakai:")
+                tui_print("    /memory save <name> <content>  — simpan memory")
+                tui_print("    /memory get <name>  — lihat detail memory")
+                tui_print("    /memory search <query>  — cari memory")
+                tui_print("    /memory delete <name>  — hapus memory")
         elif arg.startswith("save "):
             parts = arg[5:].strip().split(maxsplit=1)
             if len(parts) == 2:
                 name, content = parts
                 try:
                     filepath = memory_mgr.save(name, content)
-                    print(f"  \033[32mMemory '{name}' tersimpan\033[0m")
+                    tui_print(f"  Memory '{name}' tersimpan", "success")
                 except Exception as e:
-                    print(f"  \033[31mError: {e}\033[0m")
+                    tui_print(f"  Error: {e}", "error")
             else:
-                print("  Pakai: /memory save <name> <content>")
+                tui_print("  Pakai: /memory save <name> <content>")
         elif arg.startswith("get "):
             name = arg[4:].strip()
             memory = memory_mgr.get(name)
             if memory:
-                print(f"\033[36mMemory: {memory.get('name')}\033[0m")
-                print(f"  Type: {memory.get('type', 'project')}")
-                print(f"  Description: {memory.get('description', '-')}")
-                print(f"\n{memory.get('content', '')}")
+                tui_print(f"Memory: {memory.get('name')}", "info")
+                tui_print(f"  Type: {memory.get('type', 'project')}")
+                tui_print(f"  Description: {memory.get('description', '-')}")
+                tui_print(f"\n{memory.get('content', '')}")
             else:
-                print(f"  Memory '{name}' tidak ditemukan")
+                tui_print(f"  Memory '{name}' tidak ditemukan")
         elif arg.startswith("search "):
             query = arg[7:].strip()
             results = memory_mgr.search(query)
             if results:
-                print(f"\033[36mSearch results for '{query}':\033[0m")
+                tui_print(f"Search results for '{query}':", "info")
                 for r in results:
                     name = r.get('name', 'unknown')
                     desc = r.get('description', '')[:50]
-                    print(f"  [{r.get('type', 'project')}] {name} — {desc}")
+                    tui_print(f"  [{r.get('type', 'project')}] {name} — {desc}")
             else:
-                print(f"  Tidak ditemukan memory untuk: {query}")
+                tui_print(f"  Tidak ditemukan memory untuk: {query}")
         elif arg.startswith("delete "):
             name = arg[7:].strip()
             if memory_mgr.delete(name):
-                print(f"  \033[32mMemory '{name}' dihapus\033[0m")
+                tui_print(f"  Memory '{name}' dihapus", "success")
             else:
-                print(f"  Memory '{name}' tidak ditemukan")
+                tui_print(f"  Memory '{name}' tidak ditemukan")
         else:
-            print("  Pakai: /memory [save|get|search|delete] ...")
+            tui_print("  Pakai: /memory [save|get|search|delete] ...")
     elif cmd == "/skill":
         # Skill invocation
         if not arg:
             # List skills
             skills = skill_mgr.list_all()
             if not skills:
-                print("  Tidak ada skills tersedia.")
+                tui_print("  Tidak ada skills tersedia.")
             else:
-                print(f"\033[36mSkills ({len(skills)}):\033[0m")
+                tui_print(f"Skills ({len(skills)}):", "info")
                 for s in skills:
                     name = s.get('name', 'unknown')
                     desc = s.get('description', '')[:50]
                     source = s.get('source', 'custom')
-                    print(f"  [{source}] {name} — {desc}")
-                print("\n  Pakai: /skill <name> [args]")
-                print("  Contoh: /skill review-code file=app.py")
+                    tui_print(f"  [{source}] {name} — {desc}")
+                tui_print("\n  Pakai: /skill <name> [args]")
+                tui_print("  Contoh: /skill review-code file=app.py")
         else:
             # Parse skill name and args
             parts = arg.split(maxsplit=1)
@@ -1432,23 +1592,23 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None):
             if rendered:
                 # Treat as user message
                 messages.append({"role": "user", "content": rendered})
-                print(f"  \033[32mSkill '{skill_name}' invoked\033[0m")
+                tui_print(f"  Skill '{skill_name}' invoked", "success")
                 # Will be processed in next loop iteration
             else:
-                print(f"  Skill '{skill_name}' tidak ditemukan")
+                tui_print(f"  Skill '{skill_name}' tidak ditemukan")
     elif cmd == "/schedule":
         # Scheduler management
         if not arg:
             # List scheduled tasks
-            print(scheduler.format_list())
-            print("\n  Pakai:")
-            print("    /schedule add <cron> <prompt>  — tambah task")
-            print("    /schedule remove <id>  — hapus task")
-            print("    /schedule enable <id>  — aktifkan task")
-            print("    /schedule disable <id>  — nonaktifkan task")
-            print("\n  Cron shortcuts: @daily, @hourly, @every 5m, @every 2h")
-            print("  Cron format: minute hour day month weekday")
-            print("  Contoh: /schedule add @daily Cek status server")
+            tui_print(scheduler.format_list())
+            tui_print("\n  Pakai:")
+            tui_print("    /schedule add <cron> <prompt>  — tambah task")
+            tui_print("    /schedule remove <id>  — hapus task")
+            tui_print("    /schedule enable <id>  — aktifkan task")
+            tui_print("    /schedule disable <id>  — nonaktifkan task")
+            tui_print("\n  Cron shortcuts: @daily, @hourly, @every 5m, @every 2h")
+            tui_print("  Cron format: minute hour day month weekday")
+            tui_print("  Contoh: /schedule add @daily Cek status server")
         elif arg.startswith("add "):
             task_def = arg[4:].strip()
             # Parse: first word is cron, rest is prompt
@@ -1459,33 +1619,204 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None):
                     # Handle shortcuts
                     cron_expr = parse_cron_shortcut(cron_expr)
                     task = scheduler.add(cron_expr, prompt)
-                    print(f"  \033[32mTask ditambahkan: {task.id}\033[0m")
-                    print(f"  Cron: {cron_expr}")
-                    print(f"  Prompt: {prompt}")
+                    tui_print(f"  Task ditambahkan: {task.id}", "success")
+                    tui_print(f"  Cron: {cron_expr}")
+                    tui_print(f"  Prompt: {prompt}")
                 except ValueError as e:
-                    print(f"  \033[31mError: {e}\033[0m")
+                    tui_print(f"  Error: {e}", "error")
             else:
-                print("  Pakai: /schedule add <cron> <prompt>")
+                tui_print("  Pakai: /schedule add <cron> <prompt>")
         elif arg.startswith("remove "):
             task_id = arg[7:].strip()
             if scheduler.remove(task_id):
-                print(f"  \033[32mTask {task_id} dihapus\033[0m")
+                tui_print(f"  Task {task_id} dihapus", "success")
             else:
-                print(f"  Task {task_id} tidak ditemukan")
+                tui_print(f"  Task {task_id} tidak ditemukan")
         elif arg.startswith("enable "):
             task_id = arg[7:].strip()
             if scheduler.enable(task_id):
-                print(f"  \033[32mTask {task_id} diaktifkan\033[0m")
+                tui_print(f"  Task {task_id} diaktifkan", "success")
             else:
-                print(f"  Task {task_id} tidak ditemukan")
+                tui_print(f"  Task {task_id} tidak ditemukan")
         elif arg.startswith("disable "):
             task_id = arg[8:].strip()
             if scheduler.disable(task_id):
-                print(f"  \033[32mTask {task_id} dinonaktifkan\033[0m")
+                tui_print(f"  Task {task_id} dinonaktifkan", "success")
             else:
-                print(f"  Task {task_id} tidak ditemukan")
+                tui_print(f"  Task {task_id} tidak ditemukan")
         else:
-            print("  Pakai: /schedule [add|remove|enable|disable] ...")
+            tui_print("  Pakai: /schedule [add|remove|enable|disable] ...")
+
+    elif cmd == "/data-user":
+        user_data_mgr = get_user_data_manager()
+        if not arg:
+            # Tampilkan status
+            if user_data_mgr.is_setup():
+                tui_print("  📋 Data User — Sudah di-setup")
+                tui_print(f"  📁 Folder: {user_data_mgr.profile.get('data_folder', '-')}")
+                tui_print("")
+                tui_print("  Sub-commands:")
+                tui_print("    /data-user lihat       — Tampilkan profil lengkap")
+                tui_print("    /data-user setup        — Setup/ubah data folder")
+                tui_print("    /data-user edit <field> <value> — Edit data profil")
+                tui_print("    /data-user tambah-pendidikan <data> — Tambah pendidikan")
+                tui_print("    /data-user tambah-pengalaman <data> — Tambah pengalaman")
+                tui_print("    /data-user tambah-keahlian <skill> — Tambah keahlian")
+                tui_print("    /data-user tambah-sertifikat <data> — Tambah sertifikat")
+                tui_print("    /data-user dokumen <nama> <path> — Simpan dokumen")
+                tui_print("    /data-user surat <posisi> <perusahaan> — Generate surat lamaran")
+            else:
+                tui_print("  ⚠️  Data user belum di-setup!")
+                tui_print("  Jalankan: /data-user setup <folder_path>")
+                tui_print("")
+                tui_print("  Contoh: /data-user setup C:/Users/ardha/Documents/Data-Pribadi")
+
+        elif arg == "lihat":
+            if not user_data_mgr.is_setup():
+                tui_print("  ⚠️  Data user belum di-setup. Jalankan: /data-user setup <folder>")
+            else:
+                ringkasan = user_data_mgr.get_ringkasan()
+                tui_print(ringkasan)
+
+        elif arg.startswith("setup"):
+            parts = arg.split(maxsplit=1)
+            if len(parts) < 2:
+                tui_print("  Pakai: /data-user setup <folder_path>")
+                tui_print("  Contoh: /data-user setup C:/Users/ardha/Documents/Data-Pribadi")
+            else:
+                folder = parts[1].strip().strip('"').strip("'")
+                result = user_data_mgr.setup(folder)
+                if result["success"]:
+                    tui_print(result["message"], "success")
+                else:
+                    tui_print(f"  ❌ {result['error']}", "error")
+
+        elif arg.startswith("edit"):
+            parts = arg.split(maxsplit=2)
+            if len(parts) < 3:
+                tui_print("  Pakai: /data-user edit <field> <value>")
+                tui_print(f"  Field: {', '.join(FIELD_LABELS.keys())}")
+            else:
+                field = parts[1].strip()
+                value = parts[2].strip()
+                result = user_data_mgr.edit_profil(field, value)
+                if result["success"]:
+                    tui_print(result["message"], "success")
+                else:
+                    tui_print(f"  ❌ {result['error']}", "error")
+
+        elif arg.startswith("tambah-pendidikan"):
+            parts = arg.split(maxsplit=1)
+            if len(parts) < 2:
+                tui_print("  Pakai: /data-user tambah-pendidikan <jenjang>|<institusi>|<jurusan>|<thn_masuk>|<thn_lulus>|<ipk>")
+                tui_print("  Contoh: /data-user tambah-pendidikan S1|Universitas Indonesia|Teknik Informatika|2018|2022|3.85")
+            else:
+                fields = parts[1].strip().split("|")
+                if len(fields) < 5:
+                    tui_print("  ❌ Format: jenjang|institusi|jurusan|tahun_masuk|tahun_lulus|ipk", "error")
+                else:
+                    data = {
+                        "jenjang": fields[0].strip(),
+                        "institusi": fields[1].strip(),
+                        "jurusan": fields[2].strip(),
+                        "tahun_masuk": fields[3].strip(),
+                        "tahun_lulus": fields[4].strip(),
+                    }
+                    if len(fields) > 5:
+                        data["ipk"] = fields[5].strip()
+                    result = user_data_mgr.tambah_pendidikan(data)
+                    tui_print(result["message"], "success")
+
+        elif arg.startswith("tambah-pengalaman"):
+            parts = arg.split(maxsplit=1)
+            if len(parts) < 2:
+                tui_print("  Pakai: /data-user tambah-pengalaman <posisi>|<perusahaan>|<thn_masuk>|<thn_keluar>|<deskripsi>")
+                tui_print("  Contoh: /data-user tambah-pengalaman Software Engineer|PT ABC|2022|2024|Mengembangkan API backend")
+            else:
+                fields = parts[1].strip().split("|")
+                if len(fields) < 4:
+                    tui_print("  ❌ Format: posisi|perusahaan|tahun_masuk|tahun_keluar|deskripsi", "error")
+                else:
+                    data = {
+                        "posisi": fields[0].strip(),
+                        "perusahaan": fields[1].strip(),
+                        "tahun_masuk": fields[2].strip(),
+                        "tahun_keluar": fields[3].strip(),
+                    }
+                    if len(fields) > 4:
+                        data["deskripsi"] = fields[4].strip()
+                    result = user_data_mgr.tambah_pengalaman(data)
+                    tui_print(result["message"], "success")
+
+        elif arg.startswith("tambah-keahlian"):
+            parts = arg.split(maxsplit=1)
+            if len(parts) < 2:
+                tui_print("  Pakai: /data-user tambah-keahlian <nama_keahlian>")
+            else:
+                result = user_data_mgr.tambah_keahlian(parts[1].strip())
+                if result["success"]:
+                    tui_print(result["message"], "success")
+                else:
+                    tui_print(f"  ❌ {result['error']}", "error")
+
+        elif arg.startswith("tambah-sertifikat"):
+            parts = arg.split(maxsplit=1)
+            if len(parts) < 2:
+                tui_print("  Pakai: /data-user tambah-sertifikat <nama>|<penerbit>|<tahun>")
+                tui_print("  Contoh: /data-user tambah-sertifikat AWS Certified|Amazon|2023")
+            else:
+                fields = parts[1].strip().split("|")
+                if len(fields) < 3:
+                    tui_print("  ❌ Format: nama|penerbit|tahun", "error")
+                else:
+                    data = {
+                        "nama": fields[0].strip(),
+                        "penerbit": fields[1].strip(),
+                        "tahun": fields[2].strip(),
+                    }
+                    result = user_data_mgr.tambah_sertifikat(data)
+                    tui_print(result["message"], "success")
+
+        elif arg.startswith("dokumen"):
+            parts = arg.split(maxsplit=2)
+            if len(parts) < 3:
+                tui_print("  Pakai: /data-user dokumen <nama> <path>")
+                tui_print(f"  Nama: {', '.join(DOKUMEN_LABELS.keys())}")
+                tui_print("  Contoh: /data-user dokumen ijazah C:/Documents/ijazah.pdf")
+            else:
+                nama = parts[1].strip()
+                path = parts[2].strip().strip('"').strip("'")
+                result = user_data_mgr.tambah_dokumen(nama, path)
+                if result["success"]:
+                    tui_print(result["message"], "success")
+                else:
+                    tui_print(f"  ❌ {result['error']}", "error")
+
+        elif arg.startswith("surat"):
+            parts = arg.split(maxsplit=2)
+            if len(parts) < 3:
+                tui_print("  Pakai: /data-user surat <posisi> <perusahaan>")
+                tui_print("  Contoh: /data-user surat Backend Developer PT ABC Indonesia")
+            else:
+                if not user_data_mgr.is_setup():
+                    tui_print("  ⚠️  Data user belum di-setup. Jalankan: /data-user setup <folder>")
+                else:
+                    posisi = parts[1].strip()
+                    perusahaan = parts[2].strip()
+                    from generate_surat import generate_surat_lamaran, check_reportlab
+                    if not check_reportlab():
+                        tui_print("  ❌ Library reportlab belum di-install. Jalankan: pip install reportlab", "error")
+                    else:
+                        tui_print(f"  📄 Generating surat lamaran untuk {posisi} di {perusahaan}...")
+                        result = generate_surat_lamaran(posisi, perusahaan, user_data_mgr.get_full_profile())
+                        if result["success"]:
+                            tui_print(result["message"], "success")
+                        else:
+                            tui_print(f"  ❌ {result['error']}", "error")
+
+        else:
+            tui_print("  Sub-command tidak dikenal. Ketik /data-user untuk melihat bantuan.")
+
     else:
         # Cek plugin commands
         if plugin_mgr:
@@ -1494,22 +1825,29 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None):
                 try:
                     result = plugin_commands[cmd](arg, cfg, messages)
                     if result:
-                        print(f"  {result}")
+                        tui_print(f"  {result}")
                 except Exception as e:
-                    print(f"  \033[31mError: {e}\033[0m")
+                    tui_print(f"  Error: {e}", "error")
                 return False
 
-        print(f"  Perintah tidak dikenal: {cmd}. Ketik /help.")
+        tui_print(f"  Perintah tidak dikenal: {cmd}. Ketik /help.", "error")
     return False
 
 
-def call_llm_streaming(cfg, messages, use_tools=True, timeout=180, hook_mgr=None):
-    """Kirim permintaan ke LLM dengan streaming response.
+def call_llm_streaming(cfg, messages, use_tools=True, timeout=180, hook_mgr=None,
+                       on_token=None, on_tool_call_start=None, tui=None):
+    """Kirim permintaan ke LLM dengan TRUE streaming response.
+
+    Membaca response secara chunk-by-chunk dan parse SSE events secara incremental.
+    Token ditampilkan langsung saat diterima (true real-time streaming).
 
     Return: (message, usage) di mana message adalah dict gabungan dari semua chunks.
 
     Args:
         hook_mgr: HookManager instance (optional) untuk lifecycle hooks
+        on_token: callback(token_str) dipanggil setiap token diterima
+        on_tool_call_start: callback(tool_name) dipanggil saat tool call dimulai
+        tui: ResponsiveTUI instance untuk update progress display
     """
     # before_llm hook
     if hook_mgr:
@@ -1519,9 +1857,10 @@ def call_llm_streaming(cfg, messages, use_tools=True, timeout=180, hook_mgr=None
                 messages = r
 
     url = cfg["base_url"] + "/chat/completions"
+    clean_messages = [m for m in messages if m.get("role") not in ("thought", "churned")]
     payload = {
         "model": cfg["model"],
-        "messages": messages,
+        "messages": clean_messages,
         "temperature": 0.3,
         "stream": True  # Enable streaming
     }
@@ -1542,109 +1881,169 @@ def call_llm_streaming(cfg, messages, use_tools=True, timeout=180, hook_mgr=None
             full_content = ""
             tool_calls = []
             usage = {}
-            current_tool_call = None
+            buffer = ""
+            is_sse = None  # Detect format on first chunk
 
-            # Read response
-            response_data = resp.read().decode('utf-8')
+            # TRUE STREAMING: Read chunk-by-chunk
+            while True:
+                try:
+                    chunk_bytes = resp.read(4096)  # Read 4KB at a time
+                except Exception:
+                    break
 
-            # Check if it's SSE format or regular JSON
-            if response_data.strip().startswith('data: '):
-                # SSE format - parse line by line
-                for line in response_data.split('\n'):
-                    line = line.strip()
+                if not chunk_bytes:
+                    break  # End of stream
 
-                    # Skip empty lines
-                    if not line or not line.startswith('data: '):
-                        continue
+                buffer += chunk_bytes.decode('utf-8', errors='replace')
 
-                    # Check for end of stream
-                    if line == 'data: [DONE]':
+                # Detect format on first data
+                if is_sse is None:
+                    buffer_stripped = buffer.lstrip()
+                    if buffer_stripped.startswith('data: '):
+                        is_sse = True
+                    elif buffer_stripped.startswith('{'):
+                        is_sse = False
+                    else:
+                        continue  # Wait for more data
+
+                if is_sse:
+                    # SSE FORMAT: Parse events from buffer
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+
+                        # Skip empty lines
+                        if not line:
+                            continue
+
+                        # Only process data lines
+                        if not line.startswith('data: '):
+                            continue
+
+                        # Check for end of stream
+                        if line == 'data: [DONE]':
+                            break
+
+                        # Parse JSON chunk
+                        try:
+                            json_data = json.loads(line[6:])  # Remove 'data: ' prefix
+                        except json.JSONDecodeError:
+                            continue
+
+                        # Extract choices
+                        choices = json_data.get('choices', [])
+                        if not choices:
+                            # Check for usage in chunk
+                            if 'usage' in json_data:
+                                usage = json_data['usage']
+                            continue
+
+                        choice = choices[0]
+                        delta = choice.get('delta', {})
+
+                        # Handle content tokens
+                        if 'content' in delta and delta['content']:
+                            token = delta['content']
+                            full_content += token
+
+                            # TRUE STREAMING: Display token immediately
+                            if on_token:
+                                on_token(token)
+                            else:
+                                sys.stdout.write(token)
+                                sys.stdout.flush()
+
+                        # Handle tool calls
+                        if 'tool_calls' in delta and delta['tool_calls']:
+                            for tc in delta['tool_calls']:
+                                idx = tc.get('index', 0)
+
+                                # Initialize or get current tool call
+                                while len(tool_calls) <= idx:
+                                    tool_calls.append({
+                                        'id': '',
+                                        'type': 'function',
+                                        'function': {'name': '', 'arguments': ''}
+                                    })
+
+                                current = tool_calls[idx]
+
+                                # Update tool call data
+                                if 'id' in tc and tc['id']:
+                                    current['id'] = tc['id']
+
+                                if 'function' in tc:
+                                    if 'name' in tc['function'] and tc['function']['name']:
+                                        new_name = tc['function']['name']
+                                        if not current['function']['name']:
+                                            # First time seeing tool name
+                                            current['function']['name'] = new_name
+                                            if on_tool_call_start:
+                                                on_tool_call_start(new_name)
+                                            if tui:
+                                                tui.add_progress(f"🔧 {new_name}", "running")
+                                        else:
+                                            current['function']['name'] = new_name
+                                    if 'arguments' in tc['function']:
+                                        current['function']['arguments'] += tc['function']['arguments']
+
+                        # Handle finish reason
+                        finish = choice.get('finish_reason')
+                        if finish == 'stop':
+                            pass  # Normal completion
+                        elif finish == 'tool_calls':
+                            pass  # Will be handled after loop
+
+                    # Check if we hit [DONE]
+                    if 'data: [DONE]' in buffer:
                         break
 
-                    # Parse JSON chunk
+                else:
+                    # NON-SSE FORMAT: Regular JSON response
                     try:
-                        chunk = json.loads(line[6:])  # Remove 'data: ' prefix
+                        body = json.loads(buffer)
+                        message = body.get("choices", [{}])[0].get("message", {})
+                        usage = body.get("usage", {})
+
+                        # Stream content if available
+                        if message.get("content"):
+                            content = message["content"]
+                            if on_token:
+                                # Stream character by character for effect
+                                for char in content:
+                                    on_token(char)
+                                    time.sleep(0.01)  # Small delay for visual effect
+                            else:
+                                sys.stdout.write(content)
+                                sys.stdout.flush()
+
+                        # after_llm hook
+                        if hook_mgr:
+                            hook_results = hook_mgr.emit('after_llm', response=message)
+                            for r in hook_results:
+                                if isinstance(r, dict):
+                                    message = r
+
+                        return message, usage
                     except json.JSONDecodeError:
+                        # Might be incomplete, try to accumulate
+                        if len(buffer) > 100000:
+                            raise RuntimeError("Response too large and not valid JSON")
                         continue
 
-                    # Extract choices
-                    choices = chunk.get('choices', [])
-                    if not choices:
-                        # Check for usage in chunk
-                        if 'usage' in chunk:
-                            usage = chunk['usage']
-                        continue
-
-                    choice = choices[0]
-                    delta = choice.get('delta', {})
-
-                    # Handle content
-                    if 'content' in delta and delta['content']:
-                        content = delta['content']
-                        full_content += content
-                        # Print streaming token
-                        sys.stdout.write(content)
-                        sys.stdout.flush()
-
-                    # Handle tool calls
-                    if 'tool_calls' in delta:
-                        for tc in delta['tool_calls']:
-                            idx = tc.get('index', 0)
-
-                            # Initialize or get current tool call
-                            while len(tool_calls) <= idx:
-                                tool_calls.append({
-                                    'id': '',
-                                    'type': 'function',
-                                    'function': {'name': '', 'arguments': ''}
-                                })
-
-                            current = tool_calls[idx]
-
-                            # Update tool call data
-                            if 'id' in tc and tc['id']:
-                                current['id'] = tc['id']
-
-                            if 'function' in tc:
-                                if 'name' in tc['function'] and tc['function']['name']:
-                                    current['function']['name'] = tc['function']['name']
-                                if 'arguments' in tc['function']:
-                                    current['function']['arguments'] += tc['function']['arguments']
-
-                    # Handle finish reason
-                    if choice.get('finish_reason') == 'tool_calls':
-                        # Reconstruct tool_calls format
-                        pass
-            else:
-                # Regular JSON response - fallback to non-streaming
-                try:
-                    body = json.loads(response_data)
-                    message = body.get("choices", [{}])[0].get("message", {})
-                    usage = body.get("usage", {})
-
-                    # Print content if available
-                    if message.get("content"):
-                        sys.stdout.write(message["content"])
-                        sys.stdout.flush()
-
-                    # after_llm hook
-                    if hook_mgr:
-                        hook_results = hook_mgr.emit('after_llm', response=message)
-                        for r in hook_results:
-                            if isinstance(r, dict):
-                                message = r
-
-                    return message, usage
-                except Exception as e:
-                    raise RuntimeError(f"Invalid response format: {e}")
-
-            # Build message
+            # Build final message
             message = {"role": "assistant", "content": full_content}
 
             # Add tool calls if any
             valid_tool_calls = [tc for tc in tool_calls if tc.get('function', {}).get('name')]
             if valid_tool_calls:
                 message['tool_calls'] = valid_tool_calls
+
+            # Mark completed tool calls in TUI
+            if tui and valid_tool_calls:
+                for tc in valid_tool_calls:
+                    name = tc['function']['name']
+                    tui.update_progress(f"🔧 {name}", "done")
 
             # after_llm hook
             if hook_mgr:
@@ -1660,10 +2059,18 @@ def call_llm_streaming(cfg, messages, use_tools=True, timeout=180, hook_mgr=None
         if use_tools and e.code in (400, 404, 422) and \
                 ("tool" in detail.lower() or "function" in detail.lower()):
             print("\033[33m[info] endpoint menolak tools, mencoba ulang tanpa tools...\033[0m")
-            return call_llm_streaming(cfg, messages, use_tools=False, timeout=timeout, hook_mgr=hook_mgr)
-        raise RuntimeError(f"HTTP {e.code}: {detail}")
+            return call_llm_streaming(cfg, messages, use_tools=False, timeout=timeout,
+                                      hook_mgr=hook_mgr, on_token=on_token,
+                                      on_tool_call_start=on_tool_call_start, tui=tui)
+        raise RuntimeError(f"HTTP {e.code}: {detail[:200]}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Koneksi gagal: {e.reason}")
+    except TimeoutError:
+        raise RuntimeError("Timeout — endpoint terlalu lama merespons")
+    except RuntimeError:
+        raise  # Re-raise RuntimeError langsung
     except Exception as e:
-        raise RuntimeError(f"Streaming error: {e}")
+        raise RuntimeError(f"Streaming error: {type(e).__name__}: {e}")
 
 
 def call_llm(cfg, messages, use_tools=True, timeout=180, hook_mgr=None, _retried=False):
@@ -1691,9 +2098,10 @@ def call_llm(cfg, messages, use_tools=True, timeout=180, hook_mgr=None, _retried
                 messages = r
 
     url = cfg["base_url"] + "/chat/completions"
+    clean_messages = [m for m in messages if m.get("role") not in ("thought", "churned")]
     payload = {
         "model": cfg["model"],
-        "messages": messages,
+        "messages": clean_messages,
         "temperature": 0.3,
     }
     if use_tools:
@@ -1726,7 +2134,7 @@ def call_llm(cfg, messages, use_tools=True, timeout=180, hook_mgr=None, _retried
         if use_tools and e.code in (400, 404, 422) and \
                 ("tool" in detail.lower() or "function" in detail.lower()):
             print("\033[33m[info] endpoint menolak tools, mencoba ulang tanpa tools...\033[0m")
-            return call_llm(cfg, messages, use_tools=False, timeout=timeout)
+            return call_llm(cfg, messages, use_tools=False, timeout=timeout, hook_mgr=hook_mgr)
         raise RuntimeError(f"HTTP {e.code}: {detail}")
     except TimeoutError:
         # socket.timeout (alias TimeoutError) tidak terbungkus URLError -> tangani khusus.
@@ -1795,6 +2203,11 @@ def validate_endpoint(base_url, api_key):
 def check_tool_permission(tool_name, tool_args):
     """Check apakah tool boleh dieksekusi.
 
+    Opsi saat diminta izin:
+      1 = Izinkan sekali (tanya lagi lain kali)
+      2 = Izinkan selalu (sampai sesi berakhir)
+      3 = Tidak diizinkan
+
     Args:
         tool_name: Nama tool
         tool_args: Arguments tool
@@ -1804,13 +2217,21 @@ def check_tool_permission(tool_name, tool_args):
     """
     permission = TOOL_PERMISSIONS.get(tool_name, DEFAULT_TOOL_PERMISSION)
 
+    # Auto — langsung izinkan
     if permission == "auto":
         return True
-    elif permission == "deny":
-        print(f"\033[31m  ⚠ Tool '{tool_name}' diblokir oleh permission system\033[0m")
+
+    # Session-level always allow
+    if tool_name in SESSION_ALWAYS_ALLOW:
+        return True
+
+    # Deny — langsung tolak
+    if permission == "deny":
+        print(f"\033[31m  X Tool '{tool_name}' diblokir oleh permission system\033[0m")
         return False
-    elif permission == "ask":
-        # Format args untuk display
+
+    # Ask — tampilkan 3 opsi
+    if permission == "ask":
         args_display = ""
         if tool_args:
             if "path" in tool_args:
@@ -1820,9 +2241,25 @@ def check_tool_permission(tool_name, tool_args):
             elif "url" in tool_args:
                 args_display = f" ({tool_args['url'][:50]}...)"
 
+        print(f"\033[33m  ? Izinkan '{tool_name}'{args_display}?\033[0m")
+        print(f"\033[36m    1)\033[0m Izinkan sekali")
+        print(f"\033[36m    2)\033[0m Izinkan selalu (sampai sesi berakhir)")
+        print(f"\033[36m    3)\033[0m Tidak diizinkan")
+
         try:
-            response = input(f"\033[33m  ⚠ Izinkan tool '{tool_name}'{args_display}? [Y/n]: \033[0m").strip().lower()
-            return response in ("", "y", "yes", "ya")
+            choice = input(f"\033[33m  Pilih [1/2/3]: \033[0m").strip()
+            if choice == "1":
+                return True
+            elif choice == "2":
+                SESSION_ALWAYS_ALLOW.add(tool_name)
+                print(f"\033[32m  OK '{tool_name}' diizinkan selama sesi ini\033[0m")
+                return True
+            elif choice == "3":
+                print(f"\033[31m  X '{tool_name}' ditolak\033[0m")
+                return False
+            else:
+                # Default: izinkan sekali
+                return True
         except (EOFError, KeyboardInterrupt):
             return False
 
@@ -1879,6 +2316,14 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
         # Tampilkan tool execution di TUI atau animasi lama
         if tui:
             tui.add_tool_execution(name, args)
+            # Tambah progress ke TOP region
+            if hasattr(tui, 'add_progress'):
+                progress_text = f"{name}"
+                if args and "path" in args:
+                    progress_text += f" ({args['path']})"
+                elif args and "command" in args:
+                    progress_text += f" ({args['command'][:30]}...)"
+                tui.add_progress(progress_text, "running")
         else:
             # Fallback ke animasi lama
             anim = show_tool_animation(name, args)
@@ -1887,6 +2332,9 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
         if fn is None:
             if tui:
                 tui.add_error(f"Tool '{name}' tidak ditemukan.")
+                # Update progress ke error
+                if hasattr(tui, 'update_progress'):
+                    tui.update_progress(len(tui.progress_items) - 1, "error", f"{name} - tidak ditemukan")
             else:
                 anim.stop(f"  \033[31m↳ ERROR: tool '{name}' tidak ditemukan.\033[0m")
             output = f"ERROR: tool '{name}' tidak ditemukan."
@@ -1915,6 +2363,13 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
                             tui.add_success("Output received")
                     else:
                         tui.add_success(f"{name} completed")
+
+                    # Update progress ke done
+                    if hasattr(tui, 'update_progress'):
+                        progress_text = f"{name}"
+                        if args and "path" in args:
+                            progress_text += f" ({args['path']})"
+                        tui.update_progress(len(tui.progress_items) - 1, "done", progress_text)
                 else:
                     # Animasi lama
                     if name == "edit_file":
@@ -1944,6 +2399,9 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
             except Exception as e:
                 if tui:
                     tui.add_error(f"Error: {e}")
+                    # Update progress ke error
+                    if hasattr(tui, 'update_progress'):
+                        tui.update_progress(len(tui.progress_items) - 1, "error", f"{name} - error")
                 else:
                     anim.stop(f"  \033[31m↳ ERROR: {e}\033[0m")
                 output = f"ERROR menjalankan {name}: {e}"
@@ -1964,7 +2422,7 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
     return results
 
 
-def print_token_usage(usage, total_usage, context_info=None, model=None):
+def print_token_usage(usage, total_usage, context_info=None, model=None, tui=None):
     """Tampilkan konsumsi token dan cost estimation."""
     total_tokens = usage.get("total_tokens", 0)
     prompt_tokens = usage.get("prompt_tokens", 0)
@@ -1988,11 +2446,15 @@ def print_token_usage(usage, total_usage, context_info=None, model=None):
     else:
         cost_display = "Free"
 
-    # Tampilkan
-    if context_info and context_info.get("compressed"):
-        print(f"\033[90m  ✻ {total_tokens} tokens | {cost_display} (cached)\033[0m")
+    # Update TUI status bar jika tersedia
+    if tui and hasattr(tui, 'update_status'):
+        tui.update_status(tokens=total_tokens, cost=cost_display)
     else:
-        print(f"\033[90m  ✻ {total_tokens} tokens | {cost_display}\033[0m")
+        # Fallback ke print biasa
+        if context_info and context_info.get("compressed"):
+            print(f"\033[90m  ✻ {total_tokens} tokens | {cost_display} (cached)\033[0m")
+        else:
+            print(f"\033[90m  ✻ {total_tokens} tokens | {cost_display}\033[0m")
 
 
 def chat_loop(cfg):
@@ -2031,16 +2493,21 @@ def chat_loop(cfg):
     # Startup hook
     hook_mgr.emit('on_startup')
 
-    # Inisialisasi TUI
-    tui = AizuTUI(
+    # Inisialisasi TUI (gunakan ClaudeStyleTUI untuk layout Claude Code)
+    tui = ClaudeStyleTUI(
         workspace_path=os.getcwd(),
         backend=cfg['backend'],
         model=cfg.get('model', '')
     )
+    tui.mode = cfg.get('mode', DEFAULT_MODE)
+    tui.status_info["backend"] = cfg['backend']
+    tui.status_info["model"] = cfg.get('model', '')
+    tui.status_info["mode"] = cfg.get('mode', DEFAULT_MODE)
 
     try:
         # Setup TUI
         tui.setup()
+        tui.show_banner()
 
         # Tampilkan info plugins
         if plugin_mgr.plugins:
@@ -2079,7 +2546,7 @@ def chat_loop(cfg):
 
             # Semua perintah diawali '/' ditangani sebagai pengaturan.
             if user.startswith("/"):
-                if handle_slash(user, cfg, messages, plugin_mgr, hook_mgr, tui):
+                if handle_slash(user, cfg, messages, plugin_mgr, hook_mgr, tui, memory_mgr, skill_mgr, scheduler):
                     hook_mgr.emit('on_shutdown')
                     plugin_mgr.shutdown()
                     break
@@ -2114,23 +2581,47 @@ def chat_loop(cfg):
                 compressed = messages
 
             # Loop tool-calling: LLM bisa memanggil beberapa tool sebelum menjawab.
-            tui.start_thinking("Thinking", "ctrl+o to expand")
             tool_call_count = 0
-            MAX_TOOL_CALLS = 20  # Naikkan batas
+            tool_signatures = [] # Untuk mendeteksi perulangan/infinite loop
 
-            for _ in range(MAX_TOOL_CALLS):
+            import time
+            step_start = time.time()
+
+            while True:
+                _streamed = False
+                thought_start = time.time()
+                tui.start_thinking("Berpikir", "ctrl+o untuk memperluas")
                 try:
                     # Use streaming by default, fallback to non-streaming on error
                     try:
-                        msg, usage = call_llm_streaming(cfg, compressed, hook_mgr=hook_mgr)
+                        # Create streaming TUI untuk real-time token display
+                        stream_tui = StreamingTUI(tui)
+
+                        # Callback untuk tool call notifications
+                        def on_tool_start(name):
+                            tui.stop_thinking()
+                            tui.add_progress(f"🔧 {name}", "running")
+
+                        msg, usage = call_llm_streaming(
+                            cfg, compressed, hook_mgr=hook_mgr,
+                            on_token=stream_tui.on_token,
+                            on_tool_call_start=on_tool_start,
+                            tui=tui
+                        )
+                        stream_tui.on_complete()
+                        _streamed = True
                     except RuntimeError as streaming_error:
                         # Fallback to non-streaming
+                        _streamed = False
                         tui.stop_thinking()
-                        tui.add_info("Streaming tidak support, menggunakan non-streaming...")
-                        tui.start_thinking("Thinking", "ctrl+o to expand")
+                        err_msg = str(streaming_error)
+                        tui.add_warning(f"Streaming gagal, coba non-streaming: {err_msg[:60]}")
+                        tui.start_thinking("Berpikir", "ctrl+o untuk memperluas")
                         msg, usage = call_llm(cfg, compressed, hook_mgr=hook_mgr)
                     # Stop thinking
                     tui.stop_thinking()
+                    thought_duration = max(1, int(time.time() - thought_start))
+                    tui.add_thought_duration(thought_duration, usage=usage, model=cfg.get("model"), total_usage=total_usage)
                 except RuntimeError as e:
                     hook_mgr.emit('on_error', error=e, context={'phase': 'llm_call'})
                     tui.stop_thinking()
@@ -2145,25 +2636,36 @@ def chat_loop(cfg):
 
                 if msg.get("tool_calls"):
                     tool_call_count += 1
-                    # Tampilkan token usage untuk tool call
-                    if usage:
-                        is_compressed = len(messages) > MAX_CONTEXT_MESSAGES
-                        print_token_usage(usage, total_usage, {"compressed": is_compressed}, model=cfg.get("model"))
+                    # Token usage sudah dihandle oleh add_thought_duration()
 
-                    # Cek apakah tool call sudah terlalu banyak
-                    if tool_call_count >= MAX_TOOL_CALLS:
-                        tui.add_info(f"{tool_call_count} tool calls dilakukan, memberikan jawaban final...")
-                        # Minta LLM untuk memberikan jawaban final
-                        messages.append({"role": "user", "content": "Berikan jawaban final sekarang, jangan panggil tool lagi."})
-                        try:
-                            final_msg, final_usage = call_llm(cfg, messages, hook_mgr=hook_mgr)
-                            final_content = final_msg.get("content") or "(tidak ada jawaban)"
-                            tui.add_assistant_message(final_content)
-                            if final_usage:
-                                print_token_usage(final_usage, total_usage, model=cfg.get("model"))
-                        except:
-                            pass
-                        break
+                    # Cek perulangan (loop) pada tool call dengan argumen yang sama
+                    for tool_call in msg["tool_calls"]:
+                        t_name = tool_call["function"]["name"]
+                        t_args = tool_call["function"].get("arguments", {})
+                        import json
+                        args_str = json.dumps(t_args, sort_keys=True)
+                        sig = (t_name, args_str)
+                        tool_signatures.append(sig)
+
+                        # Hitung pemanggilan berurutan
+                        consecutive_count = 0
+                        for s in reversed(tool_signatures):
+                            if s == sig:
+                                consecutive_count += 1
+                            else:
+                                break
+
+                        if consecutive_count >= 3:
+                            tui.add_warning(f"Terdeteksi loop pada tool '{t_name}'! Mengirim koreksi ke AI...")
+                            messages.append({
+                                "role": "system",
+                                "content": (
+                                    f"System: Anda telah memanggil tool '{t_name}' dengan parameter yang sama sebanyak "
+                                    f"{consecutive_count} kali berturut-turut. Ini mengindikasikan adanya perulangan (loop). "
+                                    f"Harap JANGAN memanggil tool ini lagi dengan argumen yang sama. Analisis kesalahan "
+                                    f"yang terjadi, gunakan tool lain, atau berikan jawaban final/tanyakan klarifikasi kepada user."
+                                )
+                            })
 
                     tool_results = run_tool_calls(msg["tool_calls"], hook_mgr=hook_mgr, tui=tui)
                     messages.extend(tool_results)
@@ -2176,14 +2678,13 @@ def chat_loop(cfg):
 
                 # Tidak ada tool call -> ini jawaban final.
                 content = msg.get("content") or "(tidak ada jawaban)"
-                tui.add_assistant_message(content)
-                # Tampilkan token usage untuk response final
-                if usage:
-                    is_compressed = len(messages) > MAX_CONTEXT_MESSAGES
-                    print_token_usage(usage, total_usage, {"compressed": is_compressed}, model=cfg.get("model"))
+                # Streaming sudah menampilkan pesan, jangan tambah lagi
+                if not _streamed:
+                    tui.add_assistant_message(content)
+                # Token usage sudah dihandle oleh add_thought_duration()
+                step_duration = max(1, int(time.time() - step_start))
+                tui.add_churned_duration(step_duration, total_usage=total_usage)
                 break
-            else:
-                tui.add_info(f"Selesai setelah {MAX_TOOL_CALLS} tool calls")
 
     finally:
         # Cleanup TUI

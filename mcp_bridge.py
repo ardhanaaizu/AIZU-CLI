@@ -125,7 +125,12 @@ class MCPMessage:
 # =============================================================================
 
 class MCPStdioTransport:
-    """Transport untuk MCP server via stdin/stdout (subprocess)"""
+    """Transport untuk MCP server via stdin/stdout (subprocess)
+
+    Cross-platform: Support Windows, Linux, dan macOS.
+    Windows tidak support select.select() pada pipes, jadi
+    menggunakan threading untuk timeout.
+    """
 
     def __init__(self, command, args=None, env=None, cwd=None):
         """
@@ -142,6 +147,7 @@ class MCPStdioTransport:
         self.process = None
         self._response_cache = {}
         self._lock = threading.Lock()
+        self._is_windows = sys.platform == 'win32'
 
     def connect(self):
         """Start MCP server process"""
@@ -150,16 +156,27 @@ class MCPStdioTransport:
             full_env = os.environ.copy()
             full_env.update(self.env)
 
-            # Start process
+            # Start process dengan platform-specific settings
+            popen_kwargs = {
+                'stdin': subprocess.PIPE,
+                'stdout': subprocess.PIPE,
+                'stderr': subprocess.PIPE,
+                'env': full_env,
+                'cwd': self.cwd,
+                'text': True,
+                'bufsize': 1,
+            }
+
+            # Windows-specific: hide console window
+            if self._is_windows:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                popen_kwargs['startupinfo'] = startupinfo
+
             self.process = subprocess.Popen(
                 [self.command] + self.args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=full_env,
-                cwd=self.cwd,
-                text=True,
-                bufsize=1
+                **popen_kwargs
             )
 
             # Send initialize
@@ -178,8 +195,11 @@ class MCPStdioTransport:
             try:
                 self.process.terminate()
                 self.process.wait(timeout=5)
-            except:
-                self.process.kill()
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
             self.process = None
 
     def send(self, message):
@@ -195,13 +215,24 @@ class MCPStdioTransport:
             raise ConnectionError(f"Failed to send: {e}")
 
     def receive(self, timeout=30):
-        """Receive JSON-RPC response dari MCP server"""
+        """Receive JSON-RPC response dari MCP server.
+
+        Cross-platform implementation:
+        - Unix: Gunakan select.select() untuk non-blocking read
+        - Windows: Gunakan threading untuk timeout (select tidak support pipes)
+        """
         if not self.process:
             raise ConnectionError("MCP server not connected")
 
+        if self._is_windows:
+            return self._receive_windows(timeout)
+        else:
+            return self._receive_unix(timeout)
+
+    def _receive_unix(self, timeout=30):
+        """Unix implementation menggunakan select.select()"""
         import select
 
-        # Wait for response with timeout
         start_time = time.time()
         while time.time() - start_time < timeout:
             # Check if data available
@@ -219,6 +250,49 @@ class MCPStdioTransport:
 
         raise TimeoutError("MCP server response timeout")
 
+    def _receive_windows(self, timeout=30):
+        """Windows implementation menggunakan threading.
+
+        select.select() tidak support pipes di Windows,
+        jadi kita gunakan thread untuk membaca dengan timeout.
+        """
+        result = [None]
+        error = [None]
+
+        def read_line():
+            try:
+                line = self.process.stdout.readline()
+                if line:
+                    try:
+                        result[0] = json.loads(line.strip())
+                    except json.JSONDecodeError:
+                        # Skip invalid JSON
+                        pass
+            except Exception as e:
+                error[0] = e
+
+        # Start reader thread
+        reader = threading.Thread(target=read_line, daemon=True)
+        reader.start()
+
+        # Wait with timeout
+        reader.join(timeout=timeout)
+
+        if reader.is_alive():
+            # Timeout - thread masih running
+            raise TimeoutError("MCP server response timeout")
+
+        if error[0]:
+            raise error[0]
+
+        if result[0] is None:
+            # Check if process still running
+            if self.process.poll() is not None:
+                raise ConnectionError("MCP server process died")
+            raise TimeoutError("No response from MCP server")
+
+        return result[0]
+
     def _send_and_receive(self, message, timeout=30):
         """Send message dan tunggu response"""
         with self._lock:
@@ -235,19 +309,31 @@ class MCPStdioTransport:
 # =============================================================================
 
 class MCPSSETransport:
-    """Transport untuk MCP server via SSE (Server-Sent Events)"""
+    """Transport untuk MCP server via SSE (Server-Sent Events)
 
-    def __init__(self, url, headers=None):
+    Features:
+    - True SSE streaming support
+    - Auto-reconnect on connection loss
+    - Event parsing dari SSE stream
+    """
+
+    def __init__(self, url, headers=None, auto_reconnect=True, max_retries=3):
         """
         Args:
             url: URL MCP server SSE endpoint
             headers: HTTP headers
+            auto_reconnect: Auto-reconnect on connection loss
+            max_retries: Maximum reconnection attempts
         """
         self.url = url
         self.headers = headers or {}
         self._response_cache = {}
         self._lock = threading.Lock()
         self._connected = False
+        self._auto_reconnect = auto_reconnect
+        self._max_retries = max_retries
+        self._retry_count = 0
+        self._last_event_id = None
 
     def connect(self):
         """Connect ke SSE endpoint"""
@@ -256,6 +342,7 @@ class MCPSSETransport:
             response = self._send_and_receive(MCPMessage.initialize())
             if response and 'result' in response:
                 self._connected = True
+                self._retry_count = 0
                 return True
             return False
         except Exception as e:
@@ -265,23 +352,105 @@ class MCPSSETransport:
     def disconnect(self):
         """Disconnect dari SSE endpoint"""
         self._connected = False
+        self._retry_count = 0
 
     def send(self, message):
-        """Send JSON-RPC message via HTTP POST"""
-        try:
-            data = json.dumps(message).encode('utf-8')
-            req = urllib.request.Request(
-                self.url,
-                data=data,
-                headers={**self.headers, 'Content-Type': 'application/json'},
-                method='POST'
-            )
+        """Send JSON-RPC message via HTTP POST dengan auto-reconnect"""
+        for attempt in range(self._max_retries if self._auto_reconnect else 1):
+            try:
+                data = json.dumps(message).encode('utf-8')
+                headers = {**self.headers, 'Content-Type': 'application/json'}
 
-            with urllib.request.urlopen(req, timeout=30) as response:
-                return json.loads(response.read().decode('utf-8'))
+                # Add Last-Event-ID jika ada (untuk resume)
+                if self._last_event_id:
+                    headers['Last-Event-ID'] = self._last_event_id
 
-        except Exception as e:
-            raise ConnectionError(f"Failed to send: {e}")
+                req = urllib.request.Request(
+                    self.url,
+                    data=data,
+                    headers=headers,
+                    method='POST'
+                )
+
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    content_type = response.headers.get('Content-Type', '')
+
+                    # Check apakah response adalah SSE stream
+                    if 'text/event-stream' in content_type:
+                        return self._parse_sse_stream(response)
+                    else:
+                        # Regular JSON response
+                        return json.loads(response.read().decode('utf-8'))
+
+            except Exception as e:
+                if not self._auto_reconnect or attempt == self._max_retries - 1:
+                    raise ConnectionError(f"Failed to send: {e}")
+
+                # Exponential backoff
+                wait_time = min(2 ** attempt, 10)
+                print(f"\033[33m[MCP] Reconnect attempt {attempt + 1} in {wait_time}s...\033[0m")
+                time.sleep(wait_time)
+
+        raise ConnectionError("Max retries exceeded")
+
+    def _parse_sse_stream(self, response):
+        """Parse SSE stream dari HTTP response.
+
+        Format SSE:
+        ```
+        event: message
+        id: 123
+        data: {"jsonrpc": "2.0", ...}
+
+        ```
+
+        Returns:
+            dict: Parsed JSON-RPC response
+        """
+        buffer = ""
+        current_event = {}
+
+        for chunk in iter(lambda: response.read1(4096), b''):
+            buffer += chunk.decode('utf-8', errors='replace')
+
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                line = line.strip()
+
+                if not line:
+                    # Empty line = end of event
+                    if current_event.get('data'):
+                        try:
+                            result = json.loads(current_event['data'])
+                            # Save event ID untuk resume
+                            if 'id' in current_event:
+                                self._last_event_id = current_event['id']
+                            return result
+                        except json.JSONDecodeError:
+                            pass
+                    current_event = {}
+                    continue
+
+                if line.startswith('data: '):
+                    current_event['data'] = line[6:]
+                elif line.startswith('event: '):
+                    current_event['event'] = line[7:]
+                elif line.startswith('id: '):
+                    current_event['id'] = line[4:]
+                elif line.startswith('retry: '):
+                    try:
+                        current_event['retry'] = int(line[7:])
+                    except ValueError:
+                        pass
+
+        # Process remaining buffer
+        if current_event.get('data'):
+            try:
+                return json.loads(current_event['data'])
+            except json.JSONDecodeError:
+                pass
+
+        return None
 
     def receive(self, timeout=30):
         """Receive response (sudah di-handle di send untuk HTTP)"""
@@ -296,6 +465,11 @@ class MCPSSETransport:
     def is_connected(self):
         """Check apakah masih connected"""
         return self._connected
+
+    def reconnect(self):
+        """Force reconnect ke SSE endpoint"""
+        self.disconnect()
+        return self.connect()
 
 
 # =============================================================================

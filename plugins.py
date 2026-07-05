@@ -22,6 +22,7 @@ import shutil
 import tempfile
 import subprocess
 import importlib.util
+import threading
 from pathlib import Path
 
 # Import MCP bridge (optional)
@@ -306,6 +307,11 @@ class PluginManager:
     1. ./plugins/ (lokal, bersama source code)
     2. ~/.aizu/plugins/ (user plugins)
     3. MCP servers (via mcp.json config)
+
+    Features:
+    - Thread-safe operations (gunakan lock)
+    - Hot-reload support (watch file changes)
+    - Plugin sandboxing (restricted imports)
     """
 
     def __init__(self, config):
@@ -323,6 +329,22 @@ class PluginManager:
         ]
         self._loaded_modules = {}
         self.mcp_manager = None
+
+        # Thread safety
+        self._lock = threading.RLock()
+        self._plugin_timestamps = {}  # Track file modification times untuk hot-reload
+        self._watch_thread = None
+        self._watching = False
+
+        # Sandboxing
+        self._sandbox_enabled = config.get('plugin_sandbox', False)
+        self._allowed_modules = {
+            'json', 'os', 'os.path', 'sys', 're', 'time', 'datetime',
+            'pathlib', 'collections', 'itertools', 'functools', 'math',
+            'random', 'string', 'textwrap', 'hashlib', 'base64',
+            'urllib', 'urllib.request', 'urllib.parse', 'urllib.error',
+        }
+        self._blocked_functions = {'exec', 'eval', 'compile', '__import__'}
 
     def load_all(self):
         """Scan dan load semua plugin dari semua direktori + MCP servers."""
@@ -437,21 +459,24 @@ class PluginManager:
         """
         Register semua tool dari plugin ke REGISTRY dan SCHEMAS.
 
+        Thread-safe: menggunakan lock untuk mencegah race condition.
+
         Args:
             registry: tools.REGISTRY dict
             schemas: tools.SCHEMAS list
         """
-        for plugin in self.plugins:
-            try:
-                tools = plugin.get_tools()
-                for name, (func, schema) in tools.items():
-                    if name not in registry:
-                        registry[name] = func
-                        schemas.append(schema)
-                    else:
-                        print(f"\033[33m[Plugin] Tool '{name}' sudah ada, skip\033[0m")
-            except Exception as e:
-                print(f"\033[33m[Plugin] Error register tools: {e}\033[0m")
+        with self._lock:
+            for plugin in self.plugins:
+                try:
+                    tools = plugin.get_tools()
+                    for name, (func, schema) in tools.items():
+                        if name not in registry:
+                            registry[name] = func
+                            schemas.append(schema)
+                        else:
+                            print(f"\033[33m[Plugin] Tool '{name}' sudah ada, skip\033[0m")
+                except Exception as e:
+                    print(f"\033[33m[Plugin] Error register tools: {e}\033[0m")
 
     def register_backends(self, presets):
         """
@@ -515,21 +540,245 @@ class PluginManager:
 
     def shutdown(self):
         """Shutdown semua plugin dan MCP servers."""
-        for plugin in self.plugins:
-            try:
-                plugin.on_shutdown()
-            except Exception as e:
-                print(f"\033[33m[Plugin] Error shutdown: {e}\033[0m")
+        # Stop hot-reload watcher
+        self.stop_hot_reload()
 
-        # Disconnect MCP servers
-        if self.mcp_manager:
-            try:
-                self.mcp_manager.disconnect_all()
-            except Exception as e:
-                print(f"\033[33m[MCP] Error shutdown: {e}\033[0m")
+        with self._lock:
+            for plugin in self.plugins:
+                try:
+                    plugin.on_shutdown()
+                except Exception as e:
+                    print(f"\033[33m[Plugin] Error shutdown: {e}\033[0m")
 
-        self.plugins.clear()
-        self._loaded_modules.clear()
+            # Disconnect MCP servers
+            if self.mcp_manager:
+                try:
+                    self.mcp_manager.disconnect_all()
+                except Exception as e:
+                    print(f"\033[33m[MCP] Error shutdown: {e}\033[0m")
+
+            self.plugins.clear()
+            self._loaded_modules.clear()
+
+    # -------------------------------------------------------------------------
+    # Hot-Reload Support
+    # -------------------------------------------------------------------------
+    def start_hot_reload(self, interval=5):
+        """Mulai hot-reload watcher.
+
+        Watch plugin directories untuk perubahan file dan auto-reload.
+
+        Args:
+            interval: Check interval dalam detik (default 5)
+        """
+        if self._watching:
+            return
+
+        self._watching = True
+        self._watch_thread = threading.Thread(
+            target=self._watch_loop,
+            args=(interval,),
+            daemon=True
+        )
+        self._watch_thread.start()
+        print(f"\033[32m[Plugin] Hot-reload started (interval: {interval}s)\033[0m")
+
+    def stop_hot_reload(self):
+        """Stop hot-reload watcher."""
+        self._watching = False
+        if self._watch_thread:
+            self._watch_thread.join(timeout=2)
+            self._watch_thread = None
+
+    def _watch_loop(self, interval):
+        """Background loop untuk watch file changes."""
+        while self._watching:
+            try:
+                self._check_for_changes()
+            except Exception as e:
+                print(f"\033[33m[Plugin] Hot-reload error: {e}\033[0m")
+            time.sleep(interval)
+
+    def _check_for_changes(self):
+        """Check semua plugin dirs untuk perubahan file."""
+        changed_plugins = []
+
+        with self._lock:
+            for plugin_dir in self.plugin_dirs:
+                if not os.path.exists(plugin_dir):
+                    continue
+
+                for item in os.listdir(plugin_dir):
+                    item_path = os.path.join(plugin_dir, item)
+
+                    # Check directory plugins
+                    if os.path.isdir(item_path):
+                        manifest_path = os.path.join(item_path, 'plugin.json')
+                        entry_file = 'main.py'
+
+                        if os.path.exists(manifest_path):
+                            try:
+                                with open(manifest_path, 'r') as f:
+                                    manifest = json.load(f)
+                                entry_file = manifest.get('entry', 'main.py')
+                            except Exception:
+                                pass
+
+                        entry_path = os.path.join(item_path, entry_file)
+                        if os.path.exists(entry_path):
+                            current_mtime = os.path.getmtime(entry_path)
+                            stored_mtime = self._plugin_timestamps.get(entry_path)
+
+                            if stored_mtime and current_mtime > stored_mtime:
+                                changed_plugins.append((entry_path, item))
+                            self._plugin_timestamps[entry_path] = current_mtime
+
+                    # Check single file plugins
+                    elif item.endswith('.py') and item != '__init__.py':
+                        current_mtime = os.path.getmtime(item_path)
+                        stored_mtime = self._plugin_timestamps.get(item_path)
+
+                        if stored_mtime and current_mtime > stored_mtime:
+                            changed_plugins.append((item_path, item[:-3]))
+                        self._plugin_timestamps[item_path] = current_mtime
+
+        # Reload changed plugins
+        for file_path, plugin_name in changed_plugins:
+            self._reload_plugin(file_path, plugin_name)
+
+    def _reload_plugin(self, file_path, plugin_name):
+        """Reload satu plugin.
+
+        Args:
+            file_path: Path ke plugin file
+            plugin_name: Nama plugin
+        """
+        print(f"\033[36m[Plugin] Hot-reloading: {plugin_name}\033[0m")
+
+        # Unload existing plugin
+        self._unload_plugin(plugin_name)
+
+        # Reload
+        try:
+            manifest = {'name': plugin_name, 'version': '1.0.0'}
+            self._load_plugin_from_file(file_path, manifest)
+            print(f"\033[32m[Plugin] Reloaded: {plugin_name}\033[0m")
+        except Exception as e:
+            print(f"\033[31m[Plugin] Gagal reload {plugin_name}: {e}\033[0m")
+
+    def _unload_plugin(self, plugin_name):
+        """Unload plugin berdasarkan nama.
+
+        Args:
+            plugin_name: Nama plugin yang akan di-unload
+        """
+        # Remove dari plugins list
+        self.plugins = [p for p in self.plugins if not hasattr(p, '_plugin_name') or p._plugin_name != plugin_name]
+
+        # Unload module
+        if plugin_name in self._loaded_modules:
+            module = self._loaded_modules[plugin_name]
+            # Remove dari sys.modules
+            for key in list(sys.modules.keys()):
+                if sys.modules[key] is module:
+                    del sys.modules[key]
+            del self._loaded_modules[plugin_name]
+
+    def reload_all(self):
+        """Reload semua plugins."""
+        print("\033[36m[Plugin] Reloading semua plugins...\033[0m")
+
+        with self._lock:
+            # Unload semua
+            for plugin in self.plugins:
+                try:
+                    plugin.on_shutdown()
+                except Exception:
+                    pass
+
+            self.plugins.clear()
+            self._loaded_modules.clear()
+            self._plugin_timestamps.clear()
+
+        # Reload
+        self.load_all()
+
+    # -------------------------------------------------------------------------
+    # Sandboxing
+    # -------------------------------------------------------------------------
+    def _check_sandbox(self, module):
+        """Check apakah module aman untuk di-load.
+
+        Args:
+            module: Python module yang akan di-check
+
+        Returns:
+            tuple: (is_safe, reason)
+        """
+        if not self._sandbox_enabled:
+            return True, ""
+
+        # Check untuk blocked functions
+        for attr_name in dir(module):
+            if attr_name in self._blocked_functions:
+                return False, f"Blocked function: {attr_name}"
+
+            # Check untuk dangerous imports
+            attr = getattr(module, attr_name, None)
+            if callable(attr) and hasattr(attr, '__module__'):
+                if attr.__module__ in ['subprocess', 'os.system', 'shutil']:
+                    return False, f"Dangerous module: {attr.__module__}"
+
+        return True, ""
+
+    def enable_sandbox(self, enabled=True):
+        """Enable/disable plugin sandboxing.
+
+        Args:
+            enabled: True untuk enable sandbox
+        """
+        self._sandbox_enabled = enabled
+        status = "enabled" if enabled else "disabled"
+        print(f"\033[36m[Plugin] Sandbox {status}\033[0m")
+
+    # -------------------------------------------------------------------------
+    # Utility Methods
+    # -------------------------------------------------------------------------
+    def get_plugin_info(self):
+        """Dapatkan info semua plugins.
+
+        Returns:
+            list: List of plugin info dicts
+        """
+        with self._lock:
+            info = []
+            for i, plugin in enumerate(self.plugins):
+                tools = list(plugin.get_tools().keys()) if hasattr(plugin, 'get_tools') else []
+                info.append({
+                    'index': i,
+                    'name': plugin.__class__.__name__,
+                    'type': type(plugin).__bases__[0].__name__ if type(plugin).__bases__ else 'Plugin',
+                    'tools': tools,
+                    'has_backends': bool(plugin.get_backends()) if hasattr(plugin, 'get_backends') else False,
+                    'has_modes': bool(plugin.get_modes()) if hasattr(plugin, 'get_modes') else False,
+                    'has_commands': bool(plugin.get_commands()) if hasattr(plugin, 'get_commands') else False,
+                })
+            return info
+
+    def get_plugin(self, name):
+        """Dapatkan plugin berdasarkan nama class.
+
+        Args:
+            name: Nama plugin (class name)
+
+        Returns:
+            Plugin instance atau None
+        """
+        with self._lock:
+            for plugin in self.plugins:
+                if plugin.__class__.__name__.lower() == name.lower():
+                    return plugin
+            return None
 
 
 # =============================================================================

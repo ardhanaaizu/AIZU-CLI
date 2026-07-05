@@ -8,3 +8,8 @@ test2.txt
 *.tmp
 .aizu/
 mcp.json
+kasir-app/
+dokumen/
+speedtest/
+speedtest.zip
+plan-kasir-app.md

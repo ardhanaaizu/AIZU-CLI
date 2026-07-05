@@ -452,6 +452,8 @@ metadata:
             'ada', 'bisa', 'tidak', 'belum', 'lebih', 'sangat', 'seperti',
             'the', 'is', 'at', 'which', 'on', 'and', 'a', 'an', 'it',
             'to', 'for', 'of', 'in', 'with', 'that', 'this', 'be',
+            'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+            'could', 'should', 'may', 'might', 'can', 'shall',
         }
 
         # Tokenize
@@ -469,6 +471,365 @@ metadata:
                 unique.append(w)
 
         return unique[:10]  # Max 10 keywords
+
+    # -------------------------------------------------------------------------
+    # Smart Recall dengan TF-IDF Scoring
+    # -------------------------------------------------------------------------
+    def smart_recall(self, context, limit=5, boost_recent=True):
+        """Recall memory yang relevan dengan TF-IDF scoring.
+
+        Lebih cerdas dari search() biasa karena:
+        1. TF-IDF weighting (term frequency * inverse document frequency)
+        2. Recency boosting (memory baru dapat bonus)
+        3. Type-based boosting (user/feedback > project > reference)
+        4. Multi-keyword search dengan combinasi score
+
+        Args:
+            context: Current conversation context (user message)
+            limit: Max memories to recall
+            boost_recent: Jika True, berikan bonus untuk memory baru
+
+        Returns:
+            list: List of memory dicts yang relevan, sorted by score
+        """
+        keywords = self._extract_keywords(context)
+        if not keywords:
+            return []
+
+        # Load semua memories
+        all_memories = self.list_all()
+        if not all_memories:
+            return []
+
+        # Build document frequency (DF) untuk IDF
+        df = {}  # keyword -> jumlah memory yang mengandung keyword
+        for mem in all_memories:
+            content_lower = (mem.get('content', '') + ' ' + mem.get('description', '')).lower()
+            for kw in keywords:
+                if kw in content_lower:
+                    df[kw] = df.get(kw, 0) + 1
+
+        total_docs = len(all_memories)
+
+        # Hitung score untuk setiap memory
+        scored = []
+        now = time.time()
+
+        for mem in all_memories:
+            score = 0.0
+            content = mem.get('content', '')
+            desc = mem.get('description', '')
+            name = mem.get('name', '')
+            mem_type = mem.get('type', 'project')
+            updated = mem.get('updated', '')
+
+            combined_text = f"{name} {desc} {content}".lower()
+
+            # TF-IDF scoring untuk setiap keyword
+            for kw in keywords:
+                if kw not in combined_text:
+                    continue
+
+                # Term Frequency (TF)
+                tf = combined_text.count(kw)
+                if tf == 0:
+                    continue
+
+                # Inverse Document Frequency (IDF)
+                df_count = df.get(kw, 0)
+                if df_count == 0:
+                    idf = 0
+                else:
+                    idf = 1.0 + (total_docs / df_count)  # Smoothed IDF
+
+                # TF-IDF score
+                score += tf * idf
+
+            # Recency boost
+            if boost_recent and updated:
+                try:
+                    updated_dt = datetime.strptime(updated[:10], "%Y-%m-%d")
+                    days_old = (datetime.now() - updated_dt).days
+                    if days_old < 7:
+                        score *= 1.5  # 50% boost untuk memory < 1 minggu
+                    elif days_old < 30:
+                        score *= 1.2  # 20% boost untuk memory < 1 bulan
+                except (ValueError, TypeError):
+                    pass
+
+            # Type boost
+            type_boost = {
+                'user': 1.3,
+                'feedback': 1.2,
+                'project': 1.0,
+                'reference': 0.8
+            }
+            score *= type_boost.get(mem_type, 1.0)
+
+            if score > 0:
+                mem['score'] = score
+                scored.append(mem)
+
+        # Sort by score
+        scored.sort(key=lambda x: x.get('score', 0), reverse=True)
+        return scored[:limit]
+
+    # -------------------------------------------------------------------------
+    # Memory Deduplication
+    # -------------------------------------------------------------------------
+    def deduplicate(self, threshold=0.8, dry_run=False):
+        """Detect dan merge duplicate memories.
+
+        Menggunakan fuzzy string matching untuk mendeteksi memories
+        yang mirip dan bisa di-merge.
+
+        Args:
+            threshold: Similarity threshold (0-1, default 0.8)
+            dry_run: Jika True, hanya lapor tanpa menghapus
+
+        Returns:
+            dict: Report dengan duplicates_found, merged, details
+        """
+        all_memories = self.list_all()
+        if len(all_memories) < 2:
+            return {"duplicates_found": 0, "merged": 0, "details": []}
+
+        duplicates = []
+        checked = set()
+
+        # Compare setiap pair of memories
+        for i, mem1 in enumerate(all_memories):
+            if mem1['name'] in checked:
+                continue
+
+            for j, mem2 in enumerate(all_memories[i+1:], i+1):
+                if mem2['name'] in checked:
+                    continue
+
+                # Calculate similarity
+                similarity = self._calculate_similarity(
+                    mem1.get('content', ''),
+                    mem2.get('content', '')
+                )
+
+                if similarity >= threshold:
+                    duplicates.append({
+                        'mem1': mem1['name'],
+                        'mem2': mem2['name'],
+                        'similarity': similarity,
+                        'keep': mem1['name'],  # Keep yang lebih lama
+                        'remove': mem2['name']
+                    })
+                    checked.add(mem2['name'])
+
+        # Execute merges jika bukan dry_run
+        merged = 0
+        if not dry_run:
+            for dup in duplicates:
+                try:
+                    self.delete(dup['remove'])
+                    merged += 1
+                except Exception:
+                    pass
+
+        return {
+            "duplicates_found": len(duplicates),
+            "merged": merged,
+            "details": duplicates
+        }
+
+    def _calculate_similarity(self, text1, text2):
+        """Hitung similarity antara dua text menggunakan Jaccard similarity.
+
+        Args:
+            text1: Text pertama
+            text2: Text kedua
+
+        Returns:
+            float: Similarity score (0-1)
+        """
+        if not text1 or not text2:
+            return 0.0
+
+        # Tokenize ke words
+        words1 = set(re.findall(r'\w+', text1.lower()))
+        words2 = set(re.findall(r'\w+', text2.lower()))
+
+        # Jaccard similarity
+        intersection = words1 & words2
+        union = words1 | words2
+
+        if not union:
+            return 0.0
+
+        return len(intersection) / len(union)
+
+    # -------------------------------------------------------------------------
+    # Garbage Collection
+    # -------------------------------------------------------------------------
+    def garbage_collect(self, max_memories=100, max_age_days=90, min_access_count=0):
+        """Clean old/unused memories.
+
+        Hapus memories yang:
+        1. Lebih tua dari max_age_days DAN tidak pernah diakses
+        2. Melebihi max_memories limit (hapus yang paling lama)
+        3. Punya access_count < min_access_count
+
+        Args:
+            max_memories: Maximum memories yang diizinkan (0 = unlimited)
+            max_age_days: Maximum umur dalam hari (0 = unlimited)
+            min_access_count: Minimum access count untuk retain
+
+        Returns:
+            dict: Report dengan checked, removed, retained
+        """
+        all_memories = self.list_all()
+        if not all_memories:
+            return {"checked": 0, "removed": 0, "retained": 0}
+
+        to_remove = []
+        now = datetime.now()
+
+        for mem in all_memories:
+            should_remove = False
+            reason = ""
+
+            # Check age
+            if max_age_days > 0:
+                created = mem.get('created', '')
+                if created:
+                    try:
+                        created_dt = datetime.strptime(created[:10], "%Y-%m-%d")
+                        age_days = (now - created_dt).days
+                        if age_days > max_age_days:
+                            # Hanya hapus jika access_count rendah
+                            access_count = mem.get('access_count', 0)
+                            if access_count < min_access_count + 1:
+                                should_remove = True
+                                reason = f"old ({age_days} days)"
+                    except (ValueError, TypeError):
+                        pass
+
+            # Check access count
+            if min_access_count > 0 and not should_remove:
+                access_count = mem.get('access_count', 0)
+                if access_count < min_access_count:
+                    should_remove = True
+                    reason = f"low access ({access_count})"
+
+            if should_remove:
+                to_remove.append({
+                    'name': mem['name'],
+                    'reason': reason
+                })
+
+        # Jika masih melebihi max_memories, hapus yang paling lama
+        if max_memories > 0 and len(all_memories) - len(to_remove) > max_memories:
+            # Sort by updated date
+            remaining = [m for m in all_memories if m['name'] not in [r['name'] for r in to_remove]]
+            remaining.sort(key=lambda x: x.get('updated', ''))
+
+            # Remove excess
+            excess_count = len(remaining) - max_memories
+            for mem in remaining[:excess_count]:
+                if mem['name'] not in [r['name'] for r in to_remove]:
+                    to_remove.append({
+                        'name': mem['name'],
+                        'reason': 'excess'
+                    })
+
+        # Execute removals
+        removed = 0
+        for item in to_remove:
+            try:
+                self.delete(item['name'])
+                removed += 1
+            except Exception:
+                pass
+
+        return {
+            "checked": len(all_memories),
+            "removed": removed,
+            "retained": len(all_memories) - removed,
+            "details": to_remove
+        }
+
+    # -------------------------------------------------------------------------
+    # Auto-Extract Memories from Conversation
+    # -------------------------------------------------------------------------
+    def auto_extract(self, messages, llm_func=None):
+        """Otomatis extract fakta penting dari conversation.
+
+        Mendeteksi:
+        1. User preferences (suka X, lebih suka Y)
+        2. Project decisions (kita putuskan untuk X)
+        3. Important facts (X adalah Y)
+        4. Technical info (file X ada di Y)
+
+        Args:
+            messages: List of conversation messages
+            llm_func: Optional LLM function untuk extraction (unused for now)
+
+        Returns:
+            list: List of extracted memories (belum di-save)
+        """
+        extracted = []
+
+        for msg in messages:
+            if msg.get('role') != 'user':
+                continue
+
+            content = msg.get('content', '')
+            content_lower = content.lower()
+
+            # Detect preferences
+            pref_patterns = [
+                (r'(?:suka|suka banget|lebih suka|prefer|favorite)\s+(.+?)(?:\.|,|$)', 'preference'),
+                (r'(?:tidak suka|ga suka|hate|benci)\s+(.+?)(?:\.|,|$)', 'dislike'),
+                (r'(?:selalu|always)\s+(?:gunakan|pakai|use)\s+(.+?)(?:\.|,|$)', 'preference'),
+            ]
+
+            for pattern, pref_type in pref_patterns:
+                matches = re.findall(pattern, content_lower)
+                for match in matches:
+                    extracted.append({
+                        'type': 'user',
+                        'content': f"User {pref_type}: {match.strip()}",
+                        'source': 'auto_extract'
+                    })
+
+            # Detect decisions
+            decision_patterns = [
+                r'(?:kita|kami|let\'s)\s+(?:putuskan|decide|pilih|choose)\s+(?:untuk|to)?\s*(.+?)(?:\.|$)',
+                r'(?:akan|will)\s+(?:menggunakan|pakai|use|implement)\s+(.+?)(?:\.|$)',
+            ]
+
+            for pattern in decision_patterns:
+                matches = re.findall(pattern, content_lower)
+                for match in matches:
+                    extracted.append({
+                        'type': 'project',
+                        'content': f"Decision: {match.strip()}",
+                        'source': 'auto_extract'
+                    })
+
+            # Detect facts
+            fact_patterns = [
+                r'(.+?)\s+(?:adalah|is|merupakan)\s+(.+?)(?:\.|$)',
+                r'(?:file|folder|directory)\s+(.+?)\s+(?:ada di|terletak di|located at)\s+(.+?)(?:\.|$)',
+            ]
+
+            for pattern in fact_patterns:
+                matches = re.findall(pattern, content_lower)
+                for match in matches:
+                    if len(match) == 2:
+                        extracted.append({
+                            'type': 'reference',
+                            'content': f"{match[0].strip()} = {match[1].strip()}",
+                            'source': 'auto_extract'
+                        })
+
+        return extracted
 
 
 # =============================================================================
