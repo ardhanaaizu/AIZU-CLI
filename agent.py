@@ -39,6 +39,7 @@ from memory import get_memory_manager, create_memory_tools
 from skills import get_skill_manager
 from scheduler import get_scheduler, parse_cron_shortcut
 from user_data import get_user_data_manager, FIELD_LABELS, DOKUMEN_LABELS
+from telegram_bridge import get_telegram_bridge
 
 # ---------------------------------------------------------------------------
 # Fix encoding untuk Windows (cp1252 → utf-8)
@@ -1081,6 +1082,7 @@ COMMANDS = [
     ("/skill", "invoke skill template"),
     ("/schedule", "kelola scheduled tasks"),
     ("/data-user", "kelola data profil user"),
+    ("/telegram", "kelola Telegram bridge"),
     ("/reset", "hapus riwayat percakapan"),
     ("/keluar", "keluar dari agent"),
 ]
@@ -1811,11 +1813,167 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None, 
                         result = generate_surat_lamaran(posisi, perusahaan, user_data_mgr.get_full_profile())
                         if result["success"]:
                             tui_print(result["message"], "success")
+
+                            # Cek apakah ada Telegram bridge yang linked
+                            tg_bridge = get_telegram_bridge()
+                            if tg_bridge.has_linked_chats():
+                                tui_print("")
+                                tui_print("  📱 Kirim PDF ke Telegram?")
+                                linked = tg_bridge.get_linked_chats()
+                                for cid, info in linked.items():
+                                    name = info.get("first_name", "") or info.get("username", cid)
+                                    tui_print(f"    - {name} (ID: {cid})")
+
+                                try:
+                                    pilih = input("  Kirim ke Telegram? [y/N]: ").strip().lower()
+                                    if pilih in ("y", "ya", "yes"):
+                                        chat_id = tg_bridge.get_primary_chat_id()
+                                        if chat_id:
+                                            tui_print(f"  📤 Mengirim PDF ke Telegram...")
+                                            send_result = tg_bridge.send_document(
+                                                chat_id,
+                                                result["path"],
+                                                caption=f"📄 Surat lamaran kerja: {posisi} di {perusahaan}"
+                                            )
+                                            if send_result.get("success"):
+                                                tui_print("  ✅ PDF berhasil dikirim ke Telegram!", "success")
+                                            else:
+                                                tui_print(f"  ❌ Gagal kirim: {send_result.get('error', 'unknown')}", "error")
+                                        else:
+                                            tui_print("  ❌ Tidak ada chat ID", "error")
+                                except (EOFError, KeyboardInterrupt):
+                                    tui_print("  ⏭️  Dilewati")
                         else:
                             tui_print(f"  ❌ {result['error']}", "error")
 
         else:
             tui_print("  Sub-command tidak dikenal. Ketik /data-user untuk melihat bantuan.")
+
+    # ------------------------------------------------------------------
+    # /telegram — Kelola Telegram bridge
+    # ------------------------------------------------------------------
+    elif cmd == "/telegram":
+        bridge = get_telegram_bridge()
+
+        if not arg:
+            tui_print("  📱 Telegram Bridge — Bantuan")
+            tui_print("")
+            status = "🟢 Running" if bridge.is_polling() else "🔴 Stopped"
+            tui_print(f"  Status: {status}")
+            tui_print(f"  Token: {'✅ Set' if bridge.is_configured() else '❌ Belum di-set'}")
+            linked = bridge.get_linked_chats()
+            tui_print(f"  Linked chats: {len(linked)}")
+            tui_print("")
+            tui_print("  Perintah:")
+            tui_print("    /telegram start <bot_token> — Set token & mulai polling")
+            tui_print("    /telegram stop               — Stop polling")
+            tui_print("    /telegram status              — Cek status detail")
+            tui_print("    /telegram link <kode>         — Verifikasi kode linking")
+            tui_print("    /telegram unlink <chat_id>    — Putuskan linking")
+            tui_print("    /telegram send <chat_id> <msg> — Kirim pesan")
+
+        elif arg.startswith("start"):
+            parts = arg.split(maxsplit=1)
+            if len(parts) < 2:
+                tui_print("  Pakai: /telegram start <bot_token>")
+                tui_print("  Contoh: /telegram start 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11")
+            else:
+                token = parts[1].strip()
+                bridge.set_bot_token(token)
+                result = bridge.start_polling()
+                if result["success"]:
+                    tui_print(f"  {result['message']}", "success")
+                    # Generate kode linking otomatis
+                    link_result = bridge.generate_link_code()
+                    tui_print(f"  Kode linking: {link_result['code']}")
+                    tui_print("  Kirim /link ke bot Telegram kamu, lalu jalankan:")
+                    tui_print(f"  /telegram link {link_result['code']}")
+                else:
+                    tui_print(f"  ❌ {result['error']}", "error")
+
+        elif arg.startswith("stop"):
+            result = bridge.stop_polling()
+            if result["success"]:
+                tui_print(f"  {result['message']}", "success")
+            else:
+                tui_print(f"  ❌ {result['error']}", "error")
+
+        elif arg.startswith("status"):
+            tui_print("  📱 Telegram Bridge Status")
+            tui_print(f"  Token: {'✅ Set' if bridge.is_configured() else '❌ Belum di-set'}")
+            tui_print(f"  Polling: {'🟢 Running' if bridge.is_polling() else '🔴 Stopped'}")
+            linked = bridge.get_linked_chats()
+            if linked:
+                tui_print(f"  Linked chats ({len(linked)}):")
+                for chat_id, info in linked.items():
+                    name = info.get("first_name", "") or info.get("username", chat_id)
+                    tui_print(f"    - {name} (ID: {chat_id}) — sejak {info.get('linked_at', '-')}")
+            else:
+                tui_print("  Linked chats: tidak ada")
+
+        elif arg.startswith("link"):
+            parts = arg.split(maxsplit=1)
+            if len(parts) < 2:
+                tui_print("  Pakai: /telegram link <kode>")
+                tui_print("  Contoh: /telegram link 123456")
+            else:
+                code = parts[1].strip()
+                # Untuk verify, kita perlu chat_id dari pending code
+                # Cek apakah ada pending code dengan info chat_id
+                with bridge._lock:
+                    pending = bridge._data.get("pending_codes", {})
+                    if code in pending:
+                        info = pending[code]
+                        chat_id = info.get("chat_id")
+                        if chat_id:
+                            result = bridge.verify_link_code(
+                                code, chat_id,
+                                info.get("username", ""),
+                                info.get("first_name", "")
+                            )
+                        else:
+                            tui_print("  ❌ Kode tidak memiliki chat_id. Minta kode baru di Telegram.", "error")
+                            result = None
+                    else:
+                        tui_print("  ❌ Kode tidak ditemukan atau sudah expired.", "error")
+                        result = None
+
+                if result:
+                    if result["success"]:
+                        tui_print(f"  {result['message']}", "success")
+                    else:
+                        tui_print(f"  ❌ {result['error']}", "error")
+
+        elif arg.startswith("unlink"):
+            parts = arg.split(maxsplit=1)
+            if len(parts) < 2:
+                tui_print("  Pakai: /telegram unlink <chat_id>")
+            else:
+                try:
+                    chat_id = int(parts[1].strip())
+                    result = bridge.unlink(chat_id)
+                    if result["success"]:
+                        tui_print(f"  {result['message']}", "success")
+                    else:
+                        tui_print(f"  ❌ {result['error']}", "error")
+                except ValueError:
+                    tui_print("  ❌ Chat ID harus berupa angka", "error")
+
+        elif arg.startswith("send"):
+            parts = arg.split(maxsplit=2)
+            if len(parts) < 3:
+                tui_print("  Pakai: /telegram send <chat_id> <pesan>")
+            else:
+                try:
+                    chat_id = int(parts[1].strip())
+                    message = parts[2].strip()
+                    result = bridge.send_message(chat_id, message)
+                    if result.get("ok"):
+                        tui_print("  ✅ Pesan berhasil dikirim", "success")
+                    else:
+                        tui_print(f"  ❌ Gagal: {result.get('error', 'unknown')}", "error")
+                except ValueError:
+                    tui_print("  ❌ Chat ID harus berupa angka", "error")
 
     else:
         # Cek plugin commands
