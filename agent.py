@@ -16,6 +16,7 @@ Konfigurasi lewat environment variable atau file config.json:
 
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -1277,6 +1278,7 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None, 
                 m = choose_model_interactive(cfg, hasil)
                 if m:
                     cfg["model"] = m
+                    save_config(cfg)
                     tui_print(f"  Model -> {m}", "success")
     elif cmd == "/key":
         if arg:
@@ -1993,7 +1995,8 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None, 
 
 
 def call_llm_streaming(cfg, messages, use_tools=True, timeout=180, hook_mgr=None,
-                       on_token=None, on_tool_call_start=None, tui=None):
+                       on_token=None, on_tool_call_start=None, tui=None,
+                       interrupt_check=None):
     """Kirim permintaan ke LLM dengan TRUE streaming response.
 
     Membaca response secara chunk-by-chunk dan parse SSE events secara incremental.
@@ -2043,7 +2046,13 @@ def call_llm_streaming(cfg, messages, use_tools=True, timeout=180, hook_mgr=None
             is_sse = None  # Detect format on first chunk
 
             # TRUE STREAMING: Read chunk-by-chunk
+            _interrupted = False
             while True:
+                # Check interrupt flag (Ctrl+C)
+                if interrupt_check and interrupt_check():
+                    _interrupted = True
+                    break
+
                 try:
                     chunk_bytes = resp.read(4096)  # Read 4KB at a time
                 except Exception:
@@ -2191,6 +2200,13 @@ def call_llm_streaming(cfg, messages, use_tools=True, timeout=180, hook_mgr=None
 
             # Build final message
             message = {"role": "assistant", "content": full_content}
+
+            # Handle interrupted generation
+            if _interrupted:
+                if tui:
+                    tui.add_info("Generation interrupted")
+                # Return partial content, no tool calls
+                return message, usage
 
             # Add tool calls if any
             valid_tool_calls = [tc for tc in tool_calls if tc.get('function', {}).get('name')]
@@ -2446,6 +2462,10 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
         tui: AizuTUI instance (optional) untuk display
     """
     results = []
+    # Begin tool section with visual border
+    if tui and tool_calls:
+        tui.begin_tool_section()
+
     for tc in tool_calls:
         name = tc["function"]["name"]
         try:
@@ -2474,14 +2494,6 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
         # Tampilkan tool execution di TUI atau animasi lama
         if tui:
             tui.add_tool_execution(name, args)
-            # Tambah progress ke TOP region
-            if hasattr(tui, 'add_progress'):
-                progress_text = f"{name}"
-                if args and "path" in args:
-                    progress_text += f" ({args['path']})"
-                elif args and "command" in args:
-                    progress_text += f" ({args['command'][:30]}...)"
-                tui.add_progress(progress_text, "running")
         else:
             # Fallback ke animasi lama
             anim = show_tool_animation(name, args)
@@ -2490,44 +2502,50 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
         if fn is None:
             if tui:
                 tui.add_error(f"Tool '{name}' tidak ditemukan.")
-                # Update progress ke error
-                if hasattr(tui, 'update_progress'):
-                    tui.update_progress(len(tui.progress_items) - 1, "error", f"{name} - tidak ditemukan")
             else:
                 anim.stop(f"  \033[31m↳ ERROR: tool '{name}' tidak ditemukan.\033[0m")
             output = f"ERROR: tool '{name}' tidak ditemukan."
         else:
             try:
                 output = fn(**args)
-                # Tampilkan ringkasan hasil
-                if tui:
-                    # Format output for TUI
-                    if name == "edit_file":
-                        tui.add_success(f"File updated")
-                    elif name == "write_file":
-                        path = args.get("path", "")
-                        tui.add_success(f"Wrote to {path}")
-                    elif name == "read_file":
-                        lines = str(output).count("\n") + 1
-                        tui.add_success(f"Read {lines} lines")
-                    elif name.startswith("git"):
-                        tui.add_success(f"{name} completed")
-                    elif name == "run_shell":
-                        if output.startswith("✅"):
-                            tui.add_success("Command completed")
-                        elif output.startswith("❌"):
-                            tui.add_error("Command failed")
-                        else:
-                            tui.add_success("Output received")
-                    else:
-                        tui.add_success(f"{name} completed")
+                output_str = str(output)
 
-                    # Update progress ke done
-                    if hasattr(tui, 'update_progress'):
-                        progress_text = f"{name}"
-                        if args and "path" in args:
-                            progress_text += f" ({args['path']})"
-                        tui.update_progress(len(tui.progress_items) - 1, "done", progress_text)
+                if tui:
+                    # Extract diff lines if present (from edit_file / write_file)
+                    diff_lines = []
+                    clean_output = []
+                    for line in output_str.split('\n'):
+                        if line.startswith('DIFF:'):
+                            diff_lines.append(line[5:])  # Remove DIFF: prefix
+                        else:
+                            clean_output.append(line)
+                    clean_output_str = '\n'.join(clean_output)
+
+                    # Show diff if available
+                    if diff_lines:
+                        filepath = args.get("path", args.get("file_path", name))
+                        tui.show_diff(filepath, diff_lines)
+
+                    # Build args summary for tool block
+                    args_summary = ""
+                    if args:
+                        if "path" in args:
+                            args_summary = args['path']
+                        elif "file_path" in args:
+                            args_summary = args['file_path']
+                        elif "command" in args:
+                            args_summary = args['command'][:40]
+                        elif "pattern" in args:
+                            args_summary = args['pattern'][:30]
+                        elif "query" in args:
+                            args_summary = args['query'][:30]
+
+                    # Display as collapsible tool block
+                    tui.add_tool_block(name, args_summary, clean_output_str, collapsed=True)
+
+                    # Remove DIFF: lines from output sent back to LLM
+                    output = clean_output_str
+
                 else:
                     # Animasi lama
                     if name == "edit_file":
@@ -2557,9 +2575,6 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
             except Exception as e:
                 if tui:
                     tui.add_error(f"Error: {e}")
-                    # Update progress ke error
-                    if hasattr(tui, 'update_progress'):
-                        tui.update_progress(len(tui.progress_items) - 1, "error", f"{name} - error")
                 else:
                     anim.stop(f"  \033[31m↳ ERROR: {e}\033[0m")
                 output = f"ERROR menjalankan {name}: {e}"
@@ -2577,6 +2592,11 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
             "tool_call_id": tc["id"],
             "content": str(output),
         })
+
+    # End tool section with visual border
+    if tui and tool_calls:
+        tui.end_tool_section()
+
     return results
 
 
@@ -2667,6 +2687,10 @@ def chat_loop(cfg):
         tui.setup()
         tui.show_banner()
 
+        # Workspace info section
+        if hasattr(tui, 'show_workspace_info'):
+            tui.show_workspace_info()
+
         # Tampilkan info plugins
         if plugin_mgr.plugins:
             tui.add_info(f"Loaded {len(plugin_mgr.plugins)} plugins")
@@ -2680,6 +2704,23 @@ def chat_loop(cfg):
 
         messages = [{"role": "system", "content": build_system_prompt(mode)}]
         total_usage = {"prompt": 0, "completion": 0, "total": 0}
+
+        # Auto-read AIZU.md from project root (like Claude Code's CLAUDE.md)
+        aizu_md_paths = ["AIZU.md", "aizu.md", ".aizu.md"]
+        for md_name in aizu_md_paths:
+            md_path = os.path.join(os.getcwd(), md_name)
+            if os.path.isfile(md_path):
+                try:
+                    with open(md_path, 'r', encoding='utf-8', errors='replace') as f:
+                        aizu_md_content = f.read(10000)  # Max 10KB
+                    messages[0]["content"] += (
+                        f"\n\n--- Project Context (from {md_name}) ---\n"
+                        f"{aizu_md_content}"
+                    )
+                    tui.add_info(f"Loaded {md_name} from project root")
+                except Exception:
+                    pass
+                break
 
         while True:
             try:
@@ -2745,10 +2786,23 @@ def chat_loop(cfg):
             import time
             step_start = time.time()
 
+            # Ctrl+C interrupt support for generation
+            _generation_interrupted = False
+            def _check_interrupt():
+                return _generation_interrupted
+
             while True:
                 _streamed = False
+                _generation_interrupted = False
                 thought_start = time.time()
-                tui.start_thinking("Berpikir", "ctrl+o untuk memperluas")
+                tui.start_thinking("Berpikir")
+
+                # Install interrupt handler for Ctrl+C during generation
+                def _handle_sigint(signum, frame):
+                    nonlocal _generation_interrupted
+                    _generation_interrupted = True
+                old_sigint = signal.signal(signal.SIGINT, _handle_sigint)
+
                 try:
                     # Use streaming by default, fallback to non-streaming on error
                     try:
@@ -2758,13 +2812,14 @@ def chat_loop(cfg):
                         # Callback untuk tool call notifications
                         def on_tool_start(name):
                             tui.stop_thinking()
-                            tui.add_progress(f"🔧 {name}", "running")
+                            tui.add_tool_execution(name)
 
                         msg, usage = call_llm_streaming(
                             cfg, compressed, hook_mgr=hook_mgr,
                             on_token=stream_tui.on_token,
                             on_tool_call_start=on_tool_start,
-                            tui=tui
+                            tui=tui,
+                            interrupt_check=_check_interrupt
                         )
                         stream_tui.on_complete()
                         _streamed = True
@@ -2774,13 +2829,23 @@ def chat_loop(cfg):
                         tui.stop_thinking()
                         err_msg = str(streaming_error)
                         tui.add_warning(f"Streaming gagal, coba non-streaming: {err_msg[:60]}")
-                        tui.start_thinking("Berpikir", "ctrl+o untuk memperluas")
+                        tui.start_thinking("Berpikir")
                         msg, usage = call_llm(cfg, compressed, hook_mgr=hook_mgr)
-                    # Stop thinking
+                    # Stop thinking & restore signal handler
                     tui.stop_thinking()
+                    signal.signal(signal.SIGINT, old_sigint)
                     thought_duration = max(1, int(time.time() - thought_start))
                     tui.add_thought_duration(thought_duration, usage=usage, model=cfg.get("model"), total_usage=total_usage)
+
+                    # If interrupted, break the tool loop
+                    if _generation_interrupted:
+                        content = msg.get("content") or ""
+                        if not _streamed and content:
+                            tui.add_assistant_message(content)
+                        break
+
                 except RuntimeError as e:
+                    signal.signal(signal.SIGINT, old_sigint)
                     hook_mgr.emit('on_error', error=e, context={'phase': 'llm_call'})
                     tui.stop_thinking()
                     tui.add_error(str(e))

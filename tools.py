@@ -419,15 +419,48 @@ def read_file(path: str) -> str:
 
 
 def write_file(path: str, content: str) -> str:
-    """Tulis (atau timpa) isi file teks."""
+    """Tulis (atau timpa) isi file teks. Shows diff if overwriting existing file."""
     try:
         path = os.path.expanduser(path)
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
+
+        # Read old content for diff if file exists
+        old_content = None
+        if os.path.isfile(path):
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    old_content = f.read()
+            except Exception:
+                pass
+
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"OK: {len(content)} karakter ditulis ke {path}"
+
+        result = f"OK: {len(content)} karakter ditulis ke {path}"
+
+        # Generate diff for TUI display
+        import difflib
+        if old_content is not None:
+            old_lines = old_content.splitlines(keepends=True)
+            new_lines = content.splitlines(keepends=True)
+            diff = list(difflib.unified_diff(
+                old_lines, new_lines,
+                fromfile=f"a/{os.path.basename(path)}",
+                tofile=f"b/{os.path.basename(path)}",
+                lineterm=""
+            ))
+            if diff:
+                result += "\n" + "\n".join(f"DIFF:{line}" for line in diff)
+        else:
+            # New file — show all lines as additions
+            new_lines = content.splitlines()
+            if len(new_lines) <= 20:
+                diff_lines = [f"+{line}" for line in new_lines]
+                result += "\n" + "\n".join(f"DIFF:{line}" for line in diff_lines)
+
+        return result
     except Exception as e:
         return f"ERROR menulis file: {e}"
 
@@ -792,12 +825,27 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         count = content.count(old_text)
         new_content = content.replace(old_text, new_text, 1)
 
+        # Generate diff
+        import difflib
+        old_lines = old_text.splitlines(keepends=True)
+        new_lines = new_text.splitlines(keepends=True)
+        diff = list(difflib.unified_diff(
+            old_lines, new_lines,
+            fromfile=f"a/{os.path.basename(path)}",
+            tofile=f"b/{os.path.basename(path)}",
+            lineterm=""
+        ))
+
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
         msg = f"OK: '{old_text[:30]}...' diganti di {path}"
         if count > 1:
             msg += f" (ada {count} kemunculan, yang pertama saja diganti)"
+
+        if diff:
+            msg += "\n" + "\n".join(f"DIFF:{line}" for line in diff)
+
         return msg
     except Exception as e:
         return f"ERROR edit file: {e}"
@@ -1169,6 +1217,8 @@ def edit_file_improved(path: str, old_string: str, new_string: str, replace_all:
     - old_string: teks yang dicari (harus match persis termasuk indentasi)
     - new_string: teks pengganti
     - replace_all: jika True, ganti semua kemunculan; jika False, hanya yang pertama
+
+    Returns: result string with embedded diff (lines starting with DIFF:)
     """
     try:
         path = os.path.expanduser(path)
@@ -1189,10 +1239,27 @@ def edit_file_improved(path: str, old_string: str, new_string: str, replace_all:
             new_content = content.replace(old_string, new_string, 1)
             replaced = 1
 
+        # Generate diff before writing
+        import difflib
+        old_lines = old_string.splitlines(keepends=True)
+        new_lines = new_string.splitlines(keepends=True)
+        diff = list(difflib.unified_diff(
+            old_lines, new_lines,
+            fromfile=f"a/{os.path.basename(path)}",
+            tofile=f"b/{os.path.basename(path)}",
+            lineterm=""
+        ))
+
         with open(path, 'w', encoding='utf-8') as f:
             f.write(new_content)
 
-        return f"OK: {replaced} kemunculan diganti di {path}"
+        result = f"OK: {replaced} kemunculan diganti di {path}"
+
+        # Embed diff data for TUI display
+        if diff:
+            result += "\n" + "\n".join(f"DIFF:{line}" for line in diff)
+
+        return result
     except Exception as e:
         return f"ERROR edit: {e}"
 

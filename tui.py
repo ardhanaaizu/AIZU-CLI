@@ -13,6 +13,14 @@ import sys
 import time
 import threading
 
+# Fix Windows encoding for Unicode characters (braille spinner, box drawing)
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # Platform detection
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -1104,7 +1112,14 @@ class ClaudeStyleTUI:
         self.anim_thread = None
         self.anim_running = False
         self.frame_idx = 0
-        self.frames = ["*", ".", "*", ".", "*", ".", "*", ".", "*", "."]
+        self.frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+        # Tool block tracking (collapsible)
+        self._tool_blocks = []  # List of {name, args, result, collapsed, line_count}
+        self._collapse_all = True  # Default: collapsed
+
+        # Section state
+        self._in_tool_section = False
 
         # Streaming state (incremental display)
         self._streaming = False
@@ -1163,6 +1178,30 @@ class ClaudeStyleTUI:
     def _chat_height(self):
         """Calculate chat area height"""
         return max(5, self.height - self.HEADER_HEIGHT - self.INPUT_HEIGHT - self.STATUS_HEIGHT)
+
+    # -------------------------------------------------------------------------
+    # Section Rendering Helpers
+    # -------------------------------------------------------------------------
+    def _section_header(self, title, icon=""):
+        """Print section header: ── Title ──────────────"""
+        max_w = min(self.width, 72)
+        prefix = f"  ── {icon}{title} " if icon else f"  ── {title} "
+        padding = max(0, max_w - len(prefix))
+        line = f"{prefix}{'─' * padding}"
+        sys.stdout.write(f"{Colors.DIM}{line}{Colors.RESET}\n")
+        sys.stdout.flush()
+
+    def _section_footer(self):
+        """Print section footer: ──────────────────"""
+        max_w = min(self.width, 72)
+        sys.stdout.write(f"{Colors.DIM}  {'─' * (max_w - 2)}{Colors.RESET}\n")
+        sys.stdout.flush()
+
+    def _section_line(self, text, color=""):
+        """Print line inside a section with │ prefix"""
+        c = color if color else Colors.DIM
+        sys.stdout.write(f"{c}  │ {text}{Colors.RESET}\n")
+        sys.stdout.flush()
 
     # -------------------------------------------------------------------------
     # Setup & Cleanup
@@ -1268,6 +1307,34 @@ class ClaudeStyleTUI:
         # Spacing kosong di akhir
         add_and_print("")
         sys.stdout.flush()
+
+    def show_workspace_info(self):
+        """Display workspace info section after banner — Claude Code style."""
+        with self._lock:
+            self._section_header("Workspace")
+            self._section_line(self.workspace_path)
+            info_parts = []
+            if self.model:
+                info_parts.append(f"Model: {self.model}")
+            if self.backend:
+                info_parts.append(f"Provider: {self.backend}")
+            if info_parts:
+                self._section_line("  ·  ".join(info_parts))
+            self._section_footer()
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    def begin_tool_section(self):
+        """Start a tool execution section with visual header."""
+        self._in_tool_section = True
+        with self._lock:
+            self._section_header("Tool Calls")
+
+    def end_tool_section(self):
+        """End tool execution section with visual footer."""
+        self._in_tool_section = False
+        with self._lock:
+            self._section_footer()
 
     def setup(self):
         """Initialize TUI layout"""
@@ -1376,64 +1443,105 @@ class ClaudeStyleTUI:
     # Status Region
     # -------------------------------------------------------------------------
     def _render_status(self):
-        """No-op in sequential mode"""
-        pass
+        """Render Claude Code-style status line with git branch, model, tokens, cost."""
+        parts = []
+
+        # Git branch
+        branch = self._get_git_branch()
+        if branch:
+            parts.append(branch)
+
+        # Model
+        model = self.status_info.get("model", "")
+        if model:
+            # Shorten long model names
+            if len(model) > 30:
+                model = model.split("/")[-1] if "/" in model else model[:30]
+            parts.append(model)
+
+        # Tokens
+        tokens = self.status_info.get("tokens", 0)
+        if tokens:
+            if tokens >= 1000:
+                parts.append(f"{tokens/1000:.1f}k tokens")
+            else:
+                parts.append(f"{tokens} tokens")
+
+        # Cost
+        cost = self.status_info.get("cost", "")
+        if cost:
+            parts.append(cost)
+
+        if parts:
+            status_line = "    ".join(parts)
+            sys.stdout.write(f"{Colors.DIM}  {status_line}{Colors.RESET}")
+            sys.stdout.flush()
+
+    def _get_git_branch(self):
+        """Get current git branch name."""
+        try:
+            import subprocess
+            result = subprocess.check_output(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                stderr=subprocess.DEVNULL, timeout=2
+            )
+            return result.decode().strip()
+        except Exception:
+            return ""
 
     # -------------------------------------------------------------------------
     # Message Methods
     # -------------------------------------------------------------------------
     def add_message(self, text, role="system", icon=""):
-        """Add message ke chat area secara sequential"""
+        """Add message ke chat area — Claude Code visual style."""
         self.messages.append({
             "role": role,
             "text": text,
             "icon": icon,
             "timestamp": time.time()
         })
-        text_lines = self._wrap_text(text, self.width)
+        text_lines = self._wrap_text(text, self.width - 4)
         with self._lock:
             if role == "header":
                 for line in text_lines:
                     print(line)
             elif role == "user":
                 for line in text_lines:
-                    print(f"{Colors.GREEN}> {line}{Colors.RESET}")
+                    print(f"{Colors.GREEN}{Colors.BOLD}> {line}{Colors.RESET}")
             elif role == "assistant":
-                color = Colors.WHITE
                 for line in text_lines:
-                    print(f"{color}{line}{Colors.RESET}")
+                    print(f"{Colors.WHITE}{line}{Colors.RESET}")
             elif role == "thought":
                 color = Colors.DIM + Colors.WHITE
                 for line in text_lines:
-                    print(f"{color}{line}{Colors.RESET}")
+                    print(f"{color}  {line}{Colors.RESET}")
             elif role == "churned":
                 color = Colors.DIM + Colors.WHITE
                 for line in text_lines:
-                    print(f"{color}{line}{Colors.RESET}")
+                    print(f"{color}  {line}{Colors.RESET}")
             elif role == "tool":
-                color = Colors.YELLOW
-                for line in text_lines:
-                    print(f"{color}🔧 {line}{Colors.RESET}")
+                # Structured tool block — Claude Code style
+                header_line = f"  {Colors.DIM}── {text[:60]} {'─' * max(0, self.width - len(text[:60]) - 8)}{Colors.RESET}"
+                print(header_line)
             elif role == "tool_done":
-                color = Colors.GREEN
                 for line in text_lines:
-                    print(f"{color}✻ {line}{Colors.RESET}")
+                    print(f"{Colors.DIM}{Colors.GREEN}  ✔ {line}{Colors.RESET}")
             elif role == "error":
-                color = Colors.RED
                 for line in text_lines:
-                    print(f"{color}❌ {line}{Colors.RESET}")
+                    print(f"{Colors.RED}  ✗ {line}{Colors.RESET}")
             elif role == "info":
-                color = Colors.BLUE
                 for line in text_lines:
-                    print(f"{color}ℹ️ {line}{Colors.RESET}")
+                    print(f"{Colors.DIM}  {line}{Colors.RESET}")
             elif role == "success":
-                color = Colors.GREEN
                 for line in text_lines:
-                    print(f"{color}✅ {line}{Colors.RESET}")
+                    print(f"{Colors.GREEN}  ✓ {line}{Colors.RESET}")
+            elif role == "warning":
+                for line in text_lines:
+                    print(f"{Colors.YELLOW}  ⚠ {line}{Colors.RESET}")
             else:
                 color = Colors.DIM
                 for line in text_lines:
-                    print(f"{color}{line}{Colors.RESET}")
+                    print(f"{color}  {line}{Colors.RESET}")
             sys.stdout.flush()
 
     def add_user_message(self, text):
@@ -1457,9 +1565,8 @@ class ClaudeStyleTUI:
             self.add_message(text, "assistant", "●")
 
     def add_thought_duration(self, seconds, usage=None, model=None, total_usage=None):
-        """Add thought duration message sebaris dengan token info di akhir hasil.
-        Juga akumulasi total_usage untuk session tracking."""
-        text = f"✻ Berpikir {seconds}s"
+        """Add thought duration — Claude Code style (dim, no emoji)."""
+        text = f"Berpikir {seconds}s"
 
         if usage:
             total_tokens = usage.get("total_tokens", 0)
@@ -1472,8 +1579,6 @@ class ClaudeStyleTUI:
                 cached_tokens = usage["prompt_tokens_details"].get("cached_tokens", 0)
             if not cached_tokens:
                 cached_tokens = usage.get("prompt_cache_hit_tokens", 0)
-
-            cache_status = f"Aktif ({cached_tokens} token)" if cached_tokens > 0 else "Tidak aktif"
 
             # Cost calculation
             PRICING = {
@@ -1498,8 +1603,18 @@ class ClaudeStyleTUI:
             cost_usd = (prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]) / 1000
             cost_idr = cost_usd * USD_TO_IDR
 
-            cost_str = f"${cost_usd:.4f} (Rp{cost_idr:,.0f})" if cost_usd > 0 else "Gratis"
-            text += f" · {total_tokens} token · {cost_str} · Caching: {cache_status}"
+            cost_str = f"${cost_usd:.4f}" if cost_usd > 0 else "gratis"
+
+            # Format token count like Claude Code (compact)
+            if total_tokens >= 1000:
+                token_str = f"{total_tokens/1000:.1f}k tokens"
+            else:
+                token_str = f"{total_tokens} tokens"
+
+            text += f" · {token_str} · {cost_str}"
+
+            if cached_tokens > 0:
+                text += f" · cache: {cached_tokens}"
 
             # Akumulasi session total
             if total_usage is not None:
@@ -1524,25 +1639,29 @@ class ClaudeStyleTUI:
 
         if not has_recent:
             self.messages.append(thought_msg)
-            text_lines = self._wrap_text(thought_msg["text"], self.width)
-            color = Colors.DIM + Colors.WHITE
             with self._lock:
-                for line in text_lines:
-                    print(f"{color}{line}{Colors.RESET}")
+                print(f"{Colors.DIM}  {text}{Colors.RESET}")
                 sys.stdout.flush()
 
     def add_churned_duration(self, seconds, total_usage=None):
-        """Add churned duration message at the end, dengan session total"""
-        text = f"✻ Selesai dalam {seconds}s"
+        """Add churned duration — Claude Code style with divider."""
+        text = f"Selesai dalam {seconds}s"
         if total_usage and total_usage.get("total", 0) > 0:
             total_tokens = total_usage["total"]
             total_cost_usd = total_usage.get("cost_usd", 0)
-            total_cost_idr = total_usage.get("cost_idr", 0)
-            if total_cost_usd > 0:
-                cost_str = f"${total_cost_usd:.4f} (Rp{total_cost_idr:,.0f})"
+
+            # Compact token format
+            if total_tokens >= 1000:
+                token_str = f"{total_tokens/1000:.1f}k tokens"
             else:
-                cost_str = "Gratis"
-            text += f" · Total sesi: {total_tokens} token · {cost_str}"
+                token_str = f"{total_tokens} tokens"
+
+            if total_cost_usd > 0:
+                cost_str = f"${total_cost_usd:.4f}"
+            else:
+                cost_str = "gratis"
+            text += f" · Total: {token_str} · {cost_str}"
+
         churned_msg = {
             "role": "churned",
             "text": text,
@@ -1550,30 +1669,119 @@ class ClaudeStyleTUI:
             "timestamp": time.time()
         }
         self.messages.append(churned_msg)
-        text_lines = self._wrap_text(churned_msg["text"], self.width)
-        color = Colors.DIM + Colors.WHITE
         with self._lock:
-            for line in text_lines:
-                print(f"{color}{line}{Colors.RESET}")
+            # Divider + status line like Claude Code
+            divider = f"{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}"
+            print(f"\n{divider}")
+            print(f"{Colors.DIM}  {text}{Colors.RESET}")
+            self._render_status()
+            print()
             sys.stdout.flush()
 
     def add_tool_execution(self, tool_name, args=None):
-        """Add tool execution message"""
+        """Add tool execution message — Claude Code style with ● prefix."""
         args_str = ""
         if args:
             if "path" in args:
-                args_str = f" ({args['path']})"
+                args_str = f" {args['path']}"
+            elif "file_path" in args:
+                args_str = f" {args['file_path']}"
             elif "command" in args:
-                args_str = f" ({args['command'][:30]}...)"
-        text = f"Menjalankan: {tool_name}{args_str}"
-        self.add_message(text, "tool", "[TOOL]")
+                args_str = f" {args['command'][:40]}"
+            elif "pattern" in args:
+                args_str = f" {args['pattern'][:30]}"
+        with self._lock:
+            prefix = "  │" if self._in_tool_section else "  "
+            print(f"{Colors.DIM}{Colors.CYAN}{prefix} ● {tool_name}{args_str}{Colors.RESET}")
+            sys.stdout.flush()
 
     def add_tool_done(self, tool_name, result=""):
-        """Add tool done message"""
+        """Add tool done message — Claude Code style."""
         text = f"{tool_name} selesai"
         if result:
-            text += f": {result[:50]}"
-        self.add_message(text, "tool_done", "[OK]")
+            result_preview = result.strip()[:60].replace('\n', ' ')
+            text += f": {result_preview}"
+        with self._lock:
+            prefix = "  │" if self._in_tool_section else "  "
+            print(f"{Colors.DIM}{Colors.GREEN}{prefix} ✔ {text}{Colors.RESET}")
+            sys.stdout.flush()
+        self.messages.append({"role": "tool_done", "text": text, "icon": "", "timestamp": time.time()})
+
+    def add_tool_block(self, tool_name, args_summary, result, collapsed=True):
+        """Display tool execution as a structured block like Claude Code.
+
+        Collapsed:
+          ● Read  src/main.py                              42 lines
+        Expanded:
+          ── Read ────────────────────────────
+          │ [content...]
+          ──────────────────────────────────
+        """
+        result_str = str(result) if result else ""
+        line_count = result_str.count('\n') + 1 if result_str else 0
+
+        block = {
+            'name': tool_name,
+            'args': args_summary,
+            'result': result_str,
+            'collapsed': collapsed,
+            'line_count': line_count
+        }
+        self._tool_blocks.append(block)
+
+        with self._lock:
+            prefix = "  │" if self._in_tool_section else "  "
+            if collapsed:
+                # Compact one-line display
+                suffix = f"{line_count} lines" if line_count > 1 else "done"
+                print(f"{Colors.DIM}{Colors.CYAN}{prefix} ● {Colors.BOLD}{tool_name}{Colors.RESET}{Colors.DIM}  {args_summary}  ({suffix}){Colors.RESET}")
+            else:
+                self._print_tool_block_expanded(block)
+            sys.stdout.flush()
+
+    def _print_tool_block_expanded(self, block):
+        """Print expanded tool block with borders."""
+        name = block['name']
+        sp = "  │ " if self._in_tool_section else "  "
+        header_padding = max(0, min(self.width, 72) - len(name) - len(sp) - 4)
+        print(f"{Colors.DIM}{sp}── {name} {'─' * header_padding}{Colors.RESET}")
+
+        # Print args
+        if block['args']:
+            print(f"{Colors.DIM}{sp}│ {block['args']}{Colors.RESET}")
+
+        # Print result (truncated)
+        if block['result']:
+            lines = block['result'].split('\n')
+            max_lines = 20
+            for line in lines[:max_lines]:
+                print(f"{Colors.DIM}{sp}│ {line[:self.width - 8]}{Colors.RESET}")
+            if len(lines) > max_lines:
+                print(f"{Colors.DIM}{sp}│ ... ({len(lines) - max_lines} more lines){Colors.RESET}")
+
+        footer_width = max(0, min(self.width, 72) - len(sp) - 1)
+        print(f"{Colors.DIM}{sp}{'─' * footer_width}{Colors.RESET}")
+
+    def toggle_tool_blocks(self):
+        """Toggle collapse/expand state of tool output blocks (Ctrl+O)."""
+        self._collapse_all = not self._collapse_all
+        # Reprint last 10 tool blocks with new state
+        recent = self._tool_blocks[-10:] if len(self._tool_blocks) > 10 else self._tool_blocks
+        if not recent:
+            return
+
+        with self._lock:
+            state_label = "collapsed" if self._collapse_all else "expanded"
+            print(f"\n{Colors.DIM}  ── Tool output: {state_label} ──{Colors.RESET}")
+            for block in recent:
+                block['collapsed'] = self._collapse_all
+                if self._collapse_all:
+                    suffix = f"{block['line_count']} lines" if block['line_count'] > 1 else "done"
+                    print(f"{Colors.DIM}{Colors.CYAN}  ● {Colors.BOLD}{block['name']}{Colors.RESET}{Colors.DIM}  {block['args']}  ({suffix}){Colors.RESET}")
+                else:
+                    self._print_tool_block_expanded(block)
+            print()
+            sys.stdout.flush()
 
     def add_error(self, text):
         """Add error message"""
@@ -1591,6 +1799,40 @@ class ClaudeStyleTUI:
         """Add warning message"""
         self.add_message(text, "warning", "[WARN]")
 
+    def show_diff(self, filepath, diff_lines):
+        """Display colored diff output like Claude Code.
+
+        Args:
+            filepath: Path to the edited file
+            diff_lines: List of diff lines (from difflib.unified_diff)
+        """
+        if not diff_lines:
+            return
+
+        with self._lock:
+            sp = "  │ " if self._in_tool_section else "  "
+            # Header
+            name = os.path.basename(filepath) if '/' in filepath or '\\' in filepath else filepath
+            header_padding = max(0, min(self.width, 72) - len(name) - len(sp) - 8)
+            print(f"{Colors.DIM}{sp}── Edit {name} {'─' * header_padding}{Colors.RESET}")
+
+            for line in diff_lines:
+                line = line.rstrip()
+                if line.startswith('+++') or line.startswith('---'):
+                    print(f"{sp}{Colors.DIM}{line}{Colors.RESET}")
+                elif line.startswith('+'):
+                    print(f"{sp}{Colors.GREEN}{line}{Colors.RESET}")
+                elif line.startswith('-'):
+                    print(f"{sp}{Colors.RED}{line}{Colors.RESET}")
+                elif line.startswith('@@'):
+                    print(f"{sp}{Colors.CYAN}{line}{Colors.RESET}")
+                else:
+                    print(f"{sp}{Colors.DIM}{line}{Colors.RESET}")
+
+            footer_width = max(0, min(self.width, 72) - len(sp) - 1)
+            print(f"{Colors.DIM}{sp}{'─' * footer_width}{Colors.RESET}")
+            sys.stdout.flush()
+
     # -------------------------------------------------------------------------
     # Thinking Animation
     # -------------------------------------------------------------------------
@@ -1606,17 +1848,17 @@ class ClaudeStyleTUI:
         self.anim_thread.start()
 
     def _animate(self, stop_event):
-        """Thinking animation thread (thread-safe dengan Event)"""
+        """Thinking animation thread — braille spinner like Claude Code."""
         while not stop_event.is_set():
             elapsed = int(time.time() - self.thinking_start)
             icon = self.frames[self.frame_idx % len(self.frames)]
 
             with self._lock:
-                sys.stdout.write(f"\r{Colors.YELLOW} {icon} {self.thinking_text} ({elapsed}s)...{Colors.RESET}  ")
+                sys.stdout.write(f"\r{Colors.DIM}{Colors.YELLOW}  {icon} {self.thinking_text} {elapsed}s{Colors.RESET}   ")
                 sys.stdout.flush()
 
             self.frame_idx += 1
-            stop_event.wait(0.15)
+            stop_event.wait(0.08)
 
     def stop_thinking(self):
         """Stop thinking animation"""
@@ -1796,13 +2038,21 @@ class ClaudeStyleTUI:
             return self._input_unix()
 
     def _input_windows(self):
-        """Input dengan suggestions di Windows pakai msvcrt secara sequential."""
+        """Input dengan suggestions di Windows — Claude Code style.
+
+        Layout (suggestions muncul di bawah divider, bukan di atas):
+          ──────────────────────  (top divider)
+            /help  Bantuan        (suggestions, jika ada)
+            /config  Konfigurasi
+          > /h_                   (prompt + cursor)
+          ──────────────────────  (bottom divider)
+            ? untuk bantuan
+        """
         with self._lock:
-            # Tampilkan top divider secara mengalir (scroll)
-            sys.stdout.write(f"{Colors.VIOLET}{'-' * self.width}{Colors.RESET}\n")
+            # Tampilkan top divider
+            sys.stdout.write(f"{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
             sys.stdout.flush()
 
-        # Fallback kalau bukan TTY (piped stdin)
         if not sys.stdin.isatty():
             return input()
 
@@ -1810,62 +2060,59 @@ class ClaudeStyleTUI:
 
         buf = ""
         sel = -1
-        self._sug_lines_drawn = 0
+        # Track cursor position: how many lines below top divider the cursor sits
+        self._cursor_below_top = 0  # 0 = right after top divider
+
+        def _visible_buf():
+            max_chars = self.width - 4
+            if len(buf) <= max_chars:
+                return buf
+            return "…" + buf[-(max_chars - 1):]
 
         def render_all():
             sug = self._match_commands(buf)
-            prompt_len = 2 + len(buf)
-            prompt_rows = prompt_len // self.width + 1
+            display_buf = _visible_buf()
 
             with self._lock:
-                # 1. Hapus suggestions lama dan pulihkan chat history baris lama
-                K = self._sug_lines_drawn
-                if K > 0:
-                    sys.stdout.write(ANSI.cursor_up(K + prompt_rows))
-                    chat_lines = self.get_last_chat_lines(K)
-                    for line in chat_lines:
-                        sys.stdout.write(ANSI.clear_line())
-                        sys.stdout.write(line + "\n")
-                    # Tulis ulang top divider
-                    sys.stdout.write(ANSI.clear_line())
-                    sys.stdout.write(f"{Colors.VIOLET}{'-' * self.width}{Colors.RESET}\n")
-                    self._sug_lines_drawn = 0
-                else:
-                    if prompt_rows > 1:
-                        sys.stdout.write(ANSI.cursor_up(prompt_rows - 1))
-
-                # Sekarang kursor berada di baris pertama prompt. Hapus semuanya ke bawah!
+                # Move cursor back to right after top divider
+                if self._cursor_below_top > 0:
+                    sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
                 sys.stdout.write("\r" + ANSI.clear_to_end())
 
-                # 2. Gambar suggestions baru jika ada
+                # Write suggestions (if any)
+                lines_written = 0
                 if sug:
-                    sys.stdout.write(ANSI.cursor_up(len(sug) + 1))
                     for i, (cmd, desc) in enumerate(sug):
-                        sys.stdout.write(ANSI.clear_line())
                         if i == sel:
                             sys.stdout.write(f"  {Colors.BG_LIGHT_GRAY}{Colors.WHITE} {cmd}  {desc} {Colors.RESET}\n")
                         else:
                             sys.stdout.write(f"  {Colors.VIOLET}{cmd}{Colors.RESET}  {Colors.DIM}{desc}{Colors.RESET}\n")
-                    # Tulis ulang top divider
-                    sys.stdout.write(ANSI.clear_line())
-                    sys.stdout.write(f"{Colors.VIOLET}{'-' * self.width}{Colors.RESET}\n")
-                    self._sug_lines_drawn = len(sug)
+                        lines_written += 1
 
-                # 3. Tulis ulang prompt line + clear to end untuk bottom divider & status help
-                sys.stdout.write(f"{Colors.GREEN}> {Colors.WHITE}{buf}")
-                sys.stdout.write(f"\n{Colors.VIOLET}{'-' * self.width}{Colors.RESET}\n")
-                sys.stdout.write(f"  {Colors.DIM}{Colors.WHITE}? untuk pintasan · ← untuk agen{Colors.RESET}")
+                # Write prompt line
+                sys.stdout.write(f"{Colors.GREEN}{Colors.BOLD}> {Colors.RESET}{Colors.WHITE}{display_buf}")
+                prompt_line = lines_written  # prompt is at this line offset from top
+                lines_written += 1
 
-                # 4. Posisikan kursor kembali ke prompt line typing position
-                move_up_count = 2 + (prompt_rows - 1)
-                sys.stdout.write(ANSI.cursor_up(move_up_count))
-                cursor_col = prompt_len % self.width + 1
+                # Bottom divider + help
+                sys.stdout.write(f"\n{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
+                sys.stdout.write(f"  {Colors.DIM}? untuk bantuan · /help untuk perintah{Colors.RESET}")
+                lines_written += 2  # divider + help
+
+                # Move cursor back to prompt line
+                lines_below_prompt = lines_written - prompt_line - 1
+                if lines_below_prompt > 0:
+                    sys.stdout.write(ANSI.cursor_up(lines_below_prompt))
+                cursor_col = 2 + len(display_buf)
                 sys.stdout.write("\r")
-                if cursor_col > 1:
-                    sys.stdout.write(f"\033[{cursor_col - 1}C")
+                if cursor_col > 0:
+                    sys.stdout.write(f"\033[{cursor_col}C")
+
+                # Cursor is now at prompt line = prompt_line lines below top divider
+                self._cursor_below_top = prompt_line
+
                 sys.stdout.flush()
 
-        # Render pertama kali
         render_all()
 
         while True:
@@ -1873,42 +2120,32 @@ class ClaudeStyleTUI:
                 ch = msvcrt.getwch()
 
                 if ch in ('\r', '\n'):
-                    # Enter
                     sug = self._match_commands(buf)
                     if sug and 0 <= sel < len(sug):
                         buf = sug[sel][0]
-                    # Hapus dan pulihkan layar sebelum keluar
                     with self._lock:
-                        prompt_len = 2 + len(buf)
-                        prompt_rows = prompt_len // self.width + 1
-                        K = self._sug_lines_drawn
-                        if K > 0:
-                            sys.stdout.write(ANSI.cursor_up(K + prompt_rows))
-                            chat_lines = self.get_last_chat_lines(K)
-                            for line in chat_lines:
-                                sys.stdout.write(ANSI.clear_line())
-                                sys.stdout.write(line + "\n")
-                            self._sug_lines_drawn = 0
-                        else:
-                            sys.stdout.write(ANSI.cursor_up(prompt_rows))
-                        # Hapus area input (top divider, prompt line, bottom divider, status help)
+                        # Move to right after top divider, clear everything
+                        if self._cursor_below_top > 0:
+                            sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
                         sys.stdout.write("\r" + ANSI.clear_to_end())
-                        # Cetak pesan user secara bersih sebagai chat history
-                        print(f"{Colors.GREEN}> {buf}{Colors.RESET}")
+                        # Also clear top divider (1 line above)
+                        sys.stdout.write(ANSI.cursor_up(1))
+                        sys.stdout.write("\r" + ANSI.clear_to_end())
+                        # Print user message as chat history
+                        print(f"{Colors.GREEN}{Colors.BOLD}> {buf}{Colors.RESET}")
                         sys.stdout.flush()
+                        self._cursor_below_top = 0
                     return buf
 
                 elif ch == '\x03':
                     raise KeyboardInterrupt
 
                 elif ch == '\x08':
-                    # Backspace
                     buf = buf[:-1]
                     sel = -1
                     render_all()
 
                 elif ch == '\t':
-                    # Tab — autocomplete
                     sug = self._match_commands(buf)
                     if sug:
                         if 0 <= sel < len(sug):
@@ -1919,7 +2156,6 @@ class ClaudeStyleTUI:
                         render_all()
 
                 elif ch == '\xe0':
-                    # Arrow keys (special key prefix on Windows)
                     ch2 = msvcrt.getwch()
                     sug = self._match_commands(buf)
                     if ch2 == 'H':  # Up
@@ -1931,6 +2167,10 @@ class ClaudeStyleTUI:
                             sel = min(len(sug) - 1, sel + 1) if sel >= 0 else 0
                             render_all()
 
+                elif ch == '\x0f':
+                    self.toggle_tool_blocks()
+                    render_all()
+
                 elif ch >= ' ':
                     buf += ch
                     sel = -1
@@ -1940,14 +2180,22 @@ class ClaudeStyleTUI:
                 time.sleep(0.02)
 
     def _input_unix(self):
-        """Input dengan suggestions di Unix pakai termios secara sequential."""
+        """Input dengan suggestions di Unix — Claude Code style.
+
+        Layout (suggestions di bawah divider, bukan di atas):
+          ──────────────────────  (top divider)
+            /help  Bantuan        (suggestions, jika ada)
+            /config  Konfigurasi
+          > /h_                   (prompt + cursor)
+          ──────────────────────  (bottom divider)
+            ? untuk bantuan
+        """
         import termios
         import tty
 
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
-            # Fallback ke input() biasa
             with self._lock:
-                sys.stdout.write(f"{Colors.VIOLET}{'-' * self.width}{Colors.RESET}\n")
+                sys.stdout.write(f"{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
                 sys.stdout.flush()
             return input()
 
@@ -1955,59 +2203,55 @@ class ClaudeStyleTUI:
         old = termios.tcgetattr(fd)
         buf = ""
         sel = -1
-        self._sug_lines_drawn = 0
+        self._cursor_below_top = 0
+
+        def _visible_buf():
+            max_chars = self.width - 4
+            if len(buf) <= max_chars:
+                return buf
+            return "…" + buf[-(max_chars - 1):]
 
         def render_all():
             sug = self._match_commands(buf)
-            prompt_len = 2 + len(buf)
-            prompt_rows = prompt_len // self.width + 1
+            display_buf = _visible_buf()
 
             with self._lock:
-                # 1. Hapus suggestions lama dan pulihkan chat history baris lama
-                K = self._sug_lines_drawn
-                if K > 0:
-                    sys.stdout.write(ANSI.cursor_up(K + prompt_rows))
-                    chat_lines = self.get_last_chat_lines(K)
-                    for line in chat_lines:
-                        sys.stdout.write(ANSI.clear_line())
-                        sys.stdout.write(line + "\n")
-                    # Tulis ulang top divider
-                    sys.stdout.write(ANSI.clear_line())
-                    sys.stdout.write(f"{Colors.VIOLET}{'-' * self.width}{Colors.RESET}\n")
-                    self._sug_lines_drawn = 0
-                else:
-                    if prompt_rows > 1:
-                        sys.stdout.write(ANSI.cursor_up(prompt_rows - 1))
-
-                # Sekarang kursor berada di baris pertama prompt. Hapus semuanya ke bawah!
+                # Move cursor back to right after top divider
+                if self._cursor_below_top > 0:
+                    sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
                 sys.stdout.write("\r" + ANSI.clear_to_end())
 
-                # 2. Gambar suggestions baru jika ada
+                # Write suggestions (if any)
+                lines_written = 0
                 if sug:
-                    sys.stdout.write(ANSI.cursor_up(len(sug) + 1))
                     for i, (cmd, desc) in enumerate(sug):
-                        sys.stdout.write(ANSI.clear_line())
                         if i == sel:
                             sys.stdout.write(f"  {Colors.BG_LIGHT_GRAY}{Colors.WHITE} {cmd}  {desc} {Colors.RESET}\n")
                         else:
                             sys.stdout.write(f"  {Colors.VIOLET}{cmd}{Colors.RESET}  {Colors.DIM}{desc}{Colors.RESET}\n")
-                    # Tulis ulang top divider
-                    sys.stdout.write(ANSI.clear_line())
-                    sys.stdout.write(f"{Colors.VIOLET}{'-' * self.width}{Colors.RESET}\n")
-                    self._sug_lines_drawn = len(sug)
+                        lines_written += 1
 
-                # 3. Tulis ulang prompt line + clear to end untuk bottom divider & status help
-                sys.stdout.write(f"{Colors.GREEN}> {Colors.WHITE}{buf}")
-                sys.stdout.write(f"\n{Colors.VIOLET}{'-' * self.width}{Colors.RESET}\n")
-                sys.stdout.write(f"  {Colors.DIM}{Colors.WHITE}? untuk pintasan · ← untuk agen{Colors.RESET}")
+                # Write prompt
+                sys.stdout.write(f"{Colors.GREEN}{Colors.BOLD}> {Colors.RESET}{Colors.WHITE}{display_buf}")
+                prompt_line = lines_written
+                lines_written += 1
 
-                # 4. Posisikan kursor kembali ke prompt line typing position
-                move_up_count = 2 + (prompt_rows - 1)
-                sys.stdout.write(ANSI.cursor_up(move_up_count))
-                cursor_col = prompt_len % self.width + 1
+                # Bottom divider + help
+                sys.stdout.write(f"\n{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
+                sys.stdout.write(f"  {Colors.DIM}? untuk bantuan · /help untuk perintah{Colors.RESET}")
+                lines_written += 2
+
+                # Move cursor back to prompt line
+                lines_below_prompt = lines_written - prompt_line - 1
+                if lines_below_prompt > 0:
+                    sys.stdout.write(ANSI.cursor_up(lines_below_prompt))
+                cursor_col = 2 + len(display_buf)
                 sys.stdout.write("\r")
-                if cursor_col > 1:
-                    sys.stdout.write(f"\033[{cursor_col - 1}C")
+                if cursor_col > 0:
+                    sys.stdout.write(f"\033[{cursor_col}C")
+
+                self._cursor_below_top = prompt_line
+
                 sys.stdout.flush()
 
         try:
@@ -2019,25 +2263,16 @@ class ClaudeStyleTUI:
                     sug = self._match_commands(buf)
                     if sug and 0 <= sel < len(sug):
                         buf = sug[sel][0]
-                    # Hapus dan pulihkan layar sebelum keluar
                     with self._lock:
-                        prompt_len = 2 + len(buf)
-                        prompt_rows = prompt_len // self.width + 1
-                        K = self._sug_lines_drawn
-                        if K > 0:
-                            sys.stdout.write(ANSI.cursor_up(K + prompt_rows))
-                            chat_lines = self.get_last_chat_lines(K)
-                            for line in chat_lines:
-                                sys.stdout.write(ANSI.clear_line())
-                                sys.stdout.write(line + "\n")
-                            self._sug_lines_drawn = 0
-                        else:
-                            sys.stdout.write(ANSI.cursor_up(prompt_rows))
-                        # Hapus area input (top divider, prompt line, bottom divider, status help)
+                        if self._cursor_below_top > 0:
+                            sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
                         sys.stdout.write("\r" + ANSI.clear_to_end())
-                        # Cetak pesan user secara bersih sebagai chat history
-                        print(f"{Colors.GREEN}> {buf}{Colors.RESET}")
+                        # Also clear top divider
+                        sys.stdout.write(ANSI.cursor_up(1))
+                        sys.stdout.write("\r" + ANSI.clear_to_end())
+                        print(f"{Colors.GREEN}{Colors.BOLD}> {buf}{Colors.RESET}")
                         sys.stdout.flush()
+                        self._cursor_below_top = 0
                     return buf
                 elif ch == '\x03':
                     raise KeyboardInterrupt
@@ -2069,6 +2304,9 @@ class ClaudeStyleTUI:
                             if sug:
                                 sel = min(len(sug) - 1, sel + 1) if sel >= 0 else 0
                         render_all()
+                elif ch == '\x0f':
+                    self.toggle_tool_blocks()
+                    render_all()
                 elif ch >= ' ':
                     buf += ch
                     sel = -1
