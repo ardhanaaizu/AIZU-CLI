@@ -324,13 +324,17 @@ USD_TO_IDR = 15800  # Approximate
 TOOL_PERMISSIONS = {
     # File operations - safe
     "read_file": "auto",
+    "read_file_lines": "auto",
     "list_dir": "auto",
     "search_files": "auto",
+    "glob_files": "auto",
+    "grep_content": "auto",
     "get_file_info": "auto",
 
     # File operations - need confirmation
     "write_file": "ask",
     "edit_file": "ask",
+    "edit_file_improved": "ask",
     "fs_write_file": "ask",
     "fs_edit_file": "ask",
 
@@ -1091,8 +1095,94 @@ MAX_SUGGEST = 8
 
 
 def _match_commands(buf):
-    """Cari command yang cocok dengan teks yang sedang diketik."""
+    """Cari command yang cocok dengan teks yang sedang diketik, termasuk sub-argumen."""
+    if not buf.startswith('/'):
+        return []
     low = buf.lower()
+
+    # Autocomplete parameter file=
+    if "file=" in low:
+        prefix = buf[:buf.rfind("file=") + 5]
+        val = buf[len(prefix):]
+        try:
+            d = os.path.dirname(val) or "."
+            f_prefix = os.path.basename(val)
+            files = os.listdir(d)
+            results = []
+            for f in sorted(files):
+                if f.startswith(".") and not f_prefix.startswith("."):
+                    continue
+                if f.lower().startswith(f_prefix.lower()):
+                    full = os.path.normpath(os.path.join(d, f)).replace("\\", "/")
+                    if full.startswith("./"):
+                        full = full[2:]
+                    results.append((f"{prefix}{full}", "file"))
+            if results:
+                return results[:MAX_SUGGEST]
+        except Exception:
+            pass
+
+    # Sub-command matching untuk /mode
+    if low.startswith('/mode '):
+        arg = low[6:].strip()
+        modes = [
+            ("chat", "asisten umum (default)"),
+            ("code", "fokus menulis & memperbaiki kode"),
+            ("ringkas", "jawaban sesingkat mungkin"),
+            ("shell", "utamakan perintah shell"),
+            ("detail", "jawaban lengkap & mendalam"),
+            ("git", "fokus pada pekerjaan Git"),
+        ]
+        return [(f"/mode {m}", desc) for m, desc in modes if m.startswith(arg)][:MAX_SUGGEST]
+
+    # Sub-command matching untuk /skill
+    if low.startswith('/skill '):
+        arg = low[7:].strip()
+        skills = [
+            ("review-code", "review kualitas kode & bug"),
+            ("explain-code", "jelaskan alur kerja kode"),
+            ("debug", "analisis error dan berikan solusi"),
+            ("write-tests", "buat unit test otomatis"),
+            ("refactor", "refactor kode jadi lebih bersih"),
+            ("commit", "buat git commit message cerdas"),
+            ("docs", "buat dokumentasi fungsi / modul"),
+        ]
+        return [(f"/skill {s}", desc) for s, desc in skills if s.startswith(arg)][:MAX_SUGGEST]
+
+    # Sub-command matching untuk /backend
+    if low.startswith('/backend '):
+        arg = low[9:].strip()
+        backends = [
+            ("groq", "Groq Cloud (cepat, free tier)"),
+            ("gemini", "Google Gemini API"),
+            ("openai", "OpenAI GPT models"),
+            ("openrouter", "OpenRouter multi-model"),
+            ("ollama", "Ollama lokal (offline di HP/PC)"),
+            ("custom", "Custom endpoint OpenAI-compatible"),
+        ]
+        return [(f"/backend {b}", desc) for b, desc in backends if b.startswith(arg)][:MAX_SUGGEST]
+
+    # Sub-command matching untuk /memory
+    if low.startswith('/memory '):
+        arg = low[8:].strip()
+        mem_cmds = [
+            ("list", "tampilkan semua memori tersimpan"),
+            ("search ", "cari memori berdasarkan kata kunci"),
+            ("save ", "simpan memori baru (/memory save <nama> <isi>)"),
+            ("delete ", "hapus memori berdasarkan nama"),
+        ]
+        return [(f"/memory {m}", desc) for m, desc in mem_cmds if m.startswith(arg)][:MAX_SUGGEST]
+
+    # Sub-command matching untuk /tasks
+    if low.startswith('/tasks '):
+        arg = low[7:].strip()
+        task_cmds = [
+            ("list", "tampilkan daftar task aktif"),
+            ("create ", "buat task baru (/tasks create <deskripsi>)"),
+            ("update ", "update status task (/tasks update <id> <status>)"),
+        ]
+        return [(f"/tasks {t}", desc) for t, desc in task_cmds if t.startswith(arg)][:MAX_SUGGEST]
+
     return [(c, h) for c, h in COMMANDS if c.startswith(low)][:MAX_SUGGEST]
 
 
@@ -2374,13 +2464,77 @@ def validate_endpoint(base_url, api_key):
     return fetch_models(base_url, api_key)
 
 
+def _read_char_or_input(prompt_text):
+    """Baca 1 karakter instan (Windows/Unix) atau fallback ke input standar."""
+    sys.stdout.write(prompt_text)
+    sys.stdout.flush()
+
+    # Windows: gunakan msvcrt jika tersedia
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            ch = msvcrt.getch()
+            if isinstance(ch, bytes):
+                ch = ch.decode("utf-8", errors="ignore")
+            if ch in ("\r", "\n"):
+                sys.stdout.write("y\n")
+                sys.stdout.flush()
+                return "y"
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch in ("\x1b", "\x04"):  # Esc / Ctrl+D
+                sys.stdout.write("n\n")
+                sys.stdout.flush()
+                return "n"
+            sys.stdout.write(f"{ch}\n")
+            sys.stdout.flush()
+            return ch.strip().lower()
+        except Exception:
+            pass
+
+    # Unix / Termux: gunakan termios & tty jika interactive TTY
+    if _HAS_TTY and sys.stdin.isatty():
+        try:
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+            if ch in ("\r", "\n"):
+                sys.stdout.write("y\n")
+                sys.stdout.flush()
+                return "y"
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch in ("\x1b", "\x04"):
+                sys.stdout.write("n\n")
+                sys.stdout.flush()
+                return "n"
+            sys.stdout.write(f"{ch}\n")
+            sys.stdout.flush()
+            return ch.strip().lower()
+        except Exception:
+            pass
+
+    # Fallback standard input
+    try:
+        raw = input().strip().lower()
+        return raw if raw else "y"
+    except (EOFError, KeyboardInterrupt):
+        return "n"
+
+
 def check_tool_permission(tool_name, tool_args):
     """Check apakah tool boleh dieksekusi.
 
-    Opsi saat diminta izin:
-      1 = Izinkan sekali (tanya lagi lain kali)
-      2 = Izinkan selalu (sampai sesi berakhir)
-      3 = Tidak diizinkan
+    Pilihan konfirmasi modern ala Claude Code:
+      [y] = Ya / Izinkan sekali (default, tekan Enter atau y)
+      [a] = Selalu izinkan selama sesi ini
+      [n] = Tolak / batalkan eksekusi
+      (Mendukung juga legacy pilihan 1, 2, 3)
 
     Args:
         tool_name: Nama tool
@@ -2401,40 +2555,50 @@ def check_tool_permission(tool_name, tool_args):
 
     # Deny — langsung tolak
     if permission == "deny":
-        print(f"\033[31m  X Tool '{tool_name}' diblokir oleh permission system\033[0m")
+        print(f"\033[31m  ✗ Tool '{tool_name}' diblokir oleh permission system\033[0m")
         return False
 
-    # Ask — tampilkan 3 opsi
+    # Ask — konfirmasi bergaya Claude Code
     if permission == "ask":
         args_display = ""
         if tool_args:
             if "path" in tool_args:
                 args_display = f" ({tool_args['path']})"
+            elif "file_path" in tool_args:
+                args_display = f" ({tool_args['file_path']})"
             elif "command" in tool_args:
-                args_display = f" ({tool_args['command'][:50]}...)"
+                cmd_prev = tool_args['command']
+                if len(cmd_prev) > 55:
+                    cmd_prev = cmd_prev[:52] + "..."
+                args_display = f" (`{cmd_prev}`)"
             elif "url" in tool_args:
                 args_display = f" ({tool_args['url'][:50]}...)"
+            elif "pattern" in tool_args:
+                args_display = f" ({tool_args['pattern']})"
+            elif "query" in tool_args:
+                args_display = f" ({tool_args['query'][:50]})"
 
-        print(f"\033[33m  ? Izinkan '{tool_name}'{args_display}?\033[0m")
-        print(f"\033[36m    1)\033[0m Izinkan sekali")
-        print(f"\033[36m    2)\033[0m Izinkan selalu (sampai sesi berakhir)")
-        print(f"\033[36m    3)\033[0m Tidak diizinkan")
+        print(f"\n\033[33m  ? Izinkan eksekusi tool \033[1m{tool_name}\033[0m\033[33m{args_display}?\033[0m")
+        print(f"    \033[32m[y]\033[0m Ya (sekali)   \033[36m[a]\033[0m Selalu di sesi ini   \033[31m[n]\033[0m Tolak")
 
         try:
-            choice = input(f"\033[33m  Pilih [1/2/3]: \033[0m").strip()
-            if choice == "1":
+            choice = _read_char_or_input("\033[33m  Pilihan [y/a/n] (Enter = Ya): \033[0m")
+            if choice in ("y", "1", "yes", "ya", ""):
+                print(f"\033[32m  ✔ '{tool_name}' diizinkan\033[0m")
                 return True
-            elif choice == "2":
+            elif choice in ("a", "2", "always", "selalu"):
                 SESSION_ALWAYS_ALLOW.add(tool_name)
-                print(f"\033[32m  OK '{tool_name}' diizinkan selama sesi ini\033[0m")
+                print(f"\033[32m  ✔ '{tool_name}' diizinkan selalu selama sesi ini\033[0m")
                 return True
-            elif choice == "3":
-                print(f"\033[31m  X '{tool_name}' ditolak\033[0m")
+            elif choice in ("n", "3", "no", "tidak", "tolak", "q"):
+                print(f"\033[31m  ✗ '{tool_name}' ditolak oleh pengguna\033[0m")
                 return False
             else:
-                # Default: izinkan sekali
+                # Default: izinkan sekali jika input lain
+                print(f"\033[32m  ✔ '{tool_name}' diizinkan\033[0m")
                 return True
         except (EOFError, KeyboardInterrupt):
+            print(f"\n\033[31m  ✗ Dibatalkan\033[0m")
             return False
 
     return True
@@ -2587,10 +2751,27 @@ def run_tool_calls(tool_calls, hook_mgr=None, tui=None):
                 if isinstance(r, str):
                     output = r
 
+        output_str = str(output)
+        # Head-tail truncation untuk output tool besar agar tidak membanjiri token limit
+        if len(output_str) > 15000:
+            lines = output_str.splitlines()
+            if len(lines) > 220:
+                head = "\n".join(lines[:120])
+                tail = "\n".join(lines[-60:])
+                skipped = len(lines) - 180
+                output_str = (
+                    f"{head}\n\n"
+                    f"... [{skipped} baris terpotong untuk menghemat konteks. "
+                    f"Gunakan parameter baris/filter untuk melihat bagian tertentu] ...\n\n"
+                    f"{tail}"
+                )
+            else:
+                output_str = output_str[:10000] + "\n\n... [output terpotong untuk menghemat token konteks] ...\n\n" + output_str[-3000:]
+
         results.append({
             "role": "tool",
             "tool_call_id": tc["id"],
-            "content": str(output),
+            "content": output_str,
         })
 
     # End tool section with visual border
@@ -2768,14 +2949,15 @@ def chat_loop(cfg):
                     "content": memory_context
                 })
 
-            # Kompresi pesan untuk hemat token (prompt caching)
-            if len(messages) > MAX_CONTEXT_MESSAGES:
+            # Kompresi pesan untuk hemat token (smart context & prompt caching)
+            token_est = count_tokens_approx(str(messages))
+            if len(messages) > MAX_CONTEXT_MESSAGES or token_est > 8000:
                 compressed = compress_messages(messages, cfg=cfg)
                 # Tampilkan info kompresi
                 old_count = len(messages)
                 new_count = len(compressed)
                 saved = old_count - new_count
-                tui.add_info(f"Context compressed: {old_count} → {new_count} messages (saved {saved})")
+                tui.add_info(f"Context compressed: {old_count} → {new_count} messages (~{token_est} tokens, saved {saved})")
             else:
                 compressed = messages
 
@@ -2893,9 +3075,12 @@ def chat_loop(cfg):
                     tool_results = run_tool_calls(msg["tool_calls"], hook_mgr=hook_mgr, tui=tui)
                     messages.extend(tool_results)
 
-                    # Kompresi lagi jika perlu
-                    if len(messages) > MAX_CONTEXT_MESSAGES:
+                    # Kompresi lagi jika perlu, atau sinkronkan compressed dengan messages
+                    token_est = count_tokens_approx(str(messages))
+                    if len(messages) > MAX_CONTEXT_MESSAGES or token_est > 8000:
                         compressed = compress_messages(messages, cfg=cfg)
+                    else:
+                        compressed = messages
 
                     continue  # kirim hasil tool kembali ke LLM
 

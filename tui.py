@@ -1093,6 +1093,12 @@ class ClaudeStyleTUI:
         self.INPUT_HEIGHT = 2       # Separator + input prompt
         self.STATUS_HEIGHT = 1      # Status bar
         self._sug_lines_drawn = 0   # Track jumlah baris suggestion yang sedang digambar
+        self._scroll_region_active = False  # Track apakah scroll margin aktif (kunci mati footer & input)
+        self._has_top_border = True
+        self.scroll_bottom = self.height - 4
+        self.input_row = self.height - 2
+        self._current_bottom_state = "idle"
+        self._current_bottom_detail = ""
 
         # Data
         self.messages = []          # List of {role, text, icon, timestamp}
@@ -1168,12 +1174,20 @@ class ClaudeStyleTUI:
             self._on_resize()
 
     def _input_row(self):
-        """Row index of the input prompt line"""
-        return self.height - self.INPUT_HEIGHT - self.STATUS_HEIGHT + 1
+        """Row index of the input prompt line (terkunci mati di dasar layar)."""
+        return getattr(self, 'input_row', self.height - 2)
 
     def _on_resize(self):
-        """No-op in sequential mode"""
-        pass
+        """Handle terminal resize - update scroll margins & bottom dock."""
+        self._update_dimensions()
+        if getattr(self, '_scroll_region_active', False) and self.height >= 10:
+            self._has_top_border = (self.height >= 14)
+            self.scroll_bottom = self.height - 4 if self._has_top_border else self.height - 3
+            self.input_row = self.height - 2
+            with self._lock:
+                sys.stdout.write(f"\033[1;{self.scroll_bottom}r")
+                sys.stdout.flush()
+            self.render_bottom_dock()
 
     def _chat_height(self):
         """Calculate chat area height"""
@@ -1208,20 +1222,12 @@ class ClaudeStyleTUI:
     # -------------------------------------------------------------------------
     def show_banner(self):
         """Tampilkan banner/header premium di chat area agar bisa scroll up."""
-        left_width = 35
-        right_width = self.width - left_width - 3
-        if right_width < 10:
-            right_width = 10
-        
-        # Borders
-        title_str = "─ Aizu CLI v2.1.201 "
-        top_left = title_str + "─" * (left_width - len(title_str))
-        top_right = "─" * right_width
-        
-        border_top = f"┌{top_left}┬{top_right}┐"
-        border_bottom = f"└{'─' * left_width}┴{'─' * right_width}┘"
-        
-        # Invader ASCII
+        self._update_dimensions()
+
+        def add_and_print(text):
+            self.messages.append({"role": "header", "text": text, "timestamp": time.time()})
+            print(text)
+
         invader = [
             "  █     █  ",
             "  ███████  ",
@@ -1229,12 +1235,61 @@ class ClaudeStyleTUI:
             " █████████ ",
             "   █   █   "
         ]
-        
+
         workspace = self.workspace_path
+        model_billing = f"{self.model or 'aizu'} · API Active"
+
+        # Responsive layout: jika lebar layar sempit (< 64 kolom, misal Termux portrait)
+        if self.width < 64:
+            box_width = max(34, min(self.width - 2, 54))
+            title_str = "─ Aizu CLI v2.1 "
+            pad_title = box_width - len(title_str)
+            top_b = f"┌{title_str}{'─' * max(0, pad_title)}┐"
+            bot_b = f"└{'─' * box_width}┘"
+
+            if len(workspace) > box_width - 4:
+                workspace = "..." + workspace[-(box_width - 7):]
+            if len(model_billing) > box_width - 4:
+                model_billing = model_billing[:box_width - 7] + "..."
+
+            rows = [
+                ("Selamat datang kembali!", Colors.BOLD + Colors.WHITE),
+                (invader[0], Colors.VIOLET),
+                (invader[1], Colors.VIOLET),
+                (invader[2], Colors.VIOLET),
+                (invader[3], Colors.VIOLET),
+                (invader[4], Colors.VIOLET),
+                (model_billing, Colors.DIM + Colors.WHITE),
+                (workspace, Colors.DIM + Colors.WHITE),
+            ]
+
+            add_and_print("")
+            add_and_print(f"{Colors.VIOLET}{top_b}{Colors.RESET}")
+            for text_line, color in rows:
+                centered = text_line.center(box_width)
+                add_and_print(f"{Colors.VIOLET}│{Colors.RESET}{color}{centered}{Colors.RESET}{Colors.VIOLET}│{Colors.RESET}")
+            add_and_print(f"{Colors.VIOLET}{bot_b}{Colors.RESET}")
+            add_and_print("")
+            sys.stdout.flush()
+            return
+
+        # Desktop / Layar lebar: 2 kolom elegan (dibatasi max 74 char agar tidak melar)
+        total_width = min(self.width - 2, 74)
+        left_width = 33
+        right_width = total_width - left_width - 1
+        if right_width < 10:
+            right_width = 10
+
+        # Borders
+        title_str = "─ Aizu CLI v2.1 "
+        top_left = title_str + "─" * (left_width - len(title_str))
+        top_right = "─" * right_width
+
+        border_top = f"┌{top_left}┬{top_right}┐"
+        border_bottom = f"└{'─' * left_width}┴{'─' * right_width}┘"
+
         if len(workspace) > left_width - 4:
             workspace = "..." + workspace[-(left_width - 7):]
-            
-        model_billing = f"{self.model} · API Billing"
         if len(model_billing) > left_width - 4:
             model_billing = model_billing[:left_width - 7] + "..."
 
@@ -1248,33 +1303,29 @@ class ClaudeStyleTUI:
             model_billing.center(left_width),
             workspace.center(left_width)
         ]
-        
+
         right_rows = [
             "Yang baru",
-            "Sesi Aizu Pro kini mendukung peralatan canggih.",
-            "Memperbaiki NameError saat memanggil /skill dan /schedule.",
-            "Melompati pemblokiran DNS ISP menggunakan secure DoH.",
-            "/release-notes untuk info lebih lanjut",
+            "Sesi Aizu Pro kini mendukung tools & skills canggih.",
+            "Interactive Claude-style single-key permission.",
+            "Head-tail truncation & smart token guard.",
+            "/help untuk bantuan · /mode untuk ganti mode",
             "",
             "",
             ""
         ]
-        
-        def add_and_print(text):
-            self.messages.append({"role": "header", "text": text, "timestamp": time.time()})
-            print(text)
 
         # Spacing kosong di awal
         add_and_print("")
-        
+
         # Append top border
         add_and_print(f"{Colors.VIOLET}{border_top}{Colors.RESET}")
-        
+
         # Append rows
         for i in range(8):
             l_val = left_rows[i]
             r_val = right_rows[i]
-            
+
             l_color = Colors.WHITE
             if "Selamat" in l_val:
                 l_color = Colors.BOLD + Colors.WHITE
@@ -1282,16 +1333,16 @@ class ClaudeStyleTUI:
                 l_color = Colors.VIOLET
             else:
                 l_color = Colors.DIM + Colors.WHITE
-                
+
             r_color = Colors.WHITE
             if "Yang baru" in r_val:
                 r_color = Colors.BOLD + Colors.VIOLET
-            elif "/release" in r_val:
+            elif "/help" in r_val or "/" in r_val:
                 r_color = Colors.DIM + Colors.WHITE
-            
+
             l_part = l_val[:left_width].ljust(left_width)
             r_part = r_val[:right_width].ljust(right_width)
-            
+
             row_str = (
                 f"{Colors.VIOLET}│{Colors.RESET}"
                 f"{l_color}{l_part}{Colors.RESET}"
@@ -1300,10 +1351,10 @@ class ClaudeStyleTUI:
                 f"{Colors.VIOLET}│{Colors.RESET}"
             )
             add_and_print(row_str)
-            
+
         # Append bottom border
         add_and_print(f"{Colors.VIOLET}{border_bottom}{Colors.RESET}")
-        
+
         # Spacing kosong di akhir
         add_and_print("")
         sys.stdout.flush()
@@ -1337,7 +1388,7 @@ class ClaudeStyleTUI:
             self._section_footer()
 
     def setup(self):
-        """Initialize TUI layout"""
+        """Initialize TUI layout with locked bottom dock (input + status)."""
         self._update_dimensions()
         self._last_width = self.width
         self._last_height = self.height
@@ -1348,13 +1399,158 @@ class ClaudeStyleTUI:
                 os.system('cls')
             else:
                 sys.stdout.write("\033[2J\033[3J\033[H")
+
+            # Kunci mati dock input & status di paling bawah jika terminal mendukung
+            if sys.stdout.isatty() and self.height >= 10:
+                self._scroll_region_active = True
+                self._has_top_border = (self.height >= 14)
+                self.scroll_bottom = self.height - 4 if self._has_top_border else self.height - 3
+                self.input_row = self.height - 2
+                sys.stdout.write(f"\033[1;{self.scroll_bottom}r")
+            else:
+                self._scroll_region_active = False
+
             sys.stdout.flush()
+
+        if self._scroll_region_active:
+            self.render_bottom_dock(state="idle")
 
     def cleanup(self):
         """Cleanup on exit"""
         self._stop_animation()
         with self._lock:
+            if getattr(self, '_scroll_region_active', False):
+                sys.stdout.write("\033[r")  # Reset margins to full screen
+                start_r = self.height - 3 if getattr(self, '_has_top_border', True) else self.height - 2
+                for r in range(start_r, self.height + 1):
+                    sys.stdout.write(f"\033[{r};1H\033[2K")
+                sys.stdout.write(f"\033[{self.height};1H\n")
+                sys.stdout.write("\033[?25h")
             sys.stdout.flush()
+
+    def _get_git_branch(self):
+        """Ambil nama branch git aktif jika dalam repo git."""
+        git_head = os.path.join(self.workspace_path, ".git", "HEAD")
+        if os.path.isfile(git_head):
+            try:
+                with open(git_head, "r", encoding="utf-8") as f:
+                    ref = f.read().strip()
+                if ref.startswith("ref: refs/heads/"):
+                    return ref[16:]
+                elif len(ref) >= 7:
+                    return ref[:7]
+            except Exception:
+                pass
+        return ""
+
+    def _build_status_text(self, state="idle", detail=""):
+        """Bangun teks status footer yang informatif & dinamis."""
+        import re
+        model_name = self.model.split("/")[-1] if self.model else "aizu"
+        max_m = 12 if self.width < 60 else 18
+        if len(model_name) > max_m:
+            model_name = model_name[:max_m - 2] + ".."
+        mode_name = self.mode if hasattr(self, 'mode') and self.mode else "chat"
+
+        branch = self._get_git_branch()
+        branch_tag = f" · {Colors.CYAN}{branch}{Colors.DIM}" if (branch and self.width >= 65) else ""
+
+        # Token and cost info if available and space permits
+        meta_parts = []
+        tokens = self.status_info.get("tokens", 0)
+        if tokens:
+            if tokens >= 1000:
+                meta_parts.append(f"{tokens/1000:.1f}k tok")
+            else:
+                meta_parts.append(f"{tokens} tok")
+        cost = self.status_info.get("cost", "")
+        if cost and cost != "gratis":
+            meta_parts.append(cost)
+        meta_tag = f" · {' '.join(meta_parts)}" if (meta_parts and self.width >= 72) else ""
+
+        base = f"{Colors.DIM}AIZU {Colors.RESET}{Colors.BOLD}{model_name}{Colors.RESET} · {Colors.DIM}[{mode_name}]{branch_tag}{meta_tag}{Colors.RESET}"
+
+        if state == "thinking":
+            elapsed = int(time.time() - self.thinking_start) if self.thinking_start else 0
+            icon = self.frames[self.frame_idx % len(self.frames)]
+            action = f"{Colors.YELLOW}{icon} Berpikir {elapsed}s...{Colors.RESET}"
+        elif state == "answering":
+            action = f"{Colors.GREEN}● Menjawab...{Colors.RESET}"
+        elif state == "tool":
+            t_name = detail or "tool"
+            if len(t_name) > 16:
+                t_name = t_name[:14] + ".."
+            action = f"{Colors.CYAN}⚙ {t_name}...{Colors.RESET}"
+        else:
+            action = f"{Colors.DIM}? bantuan · /help{Colors.RESET}"
+
+        full = f"  {base} {Colors.DIM}│{Colors.RESET} {action}"
+
+        # Guard: pastikan visible length <= self.width - 1 agar tidak memicu auto-scroll
+        vis_len = len(re.sub(r'\033\[[0-9;]*[a-zA-Z]', '', full))
+        if vis_len > self.width - 1:
+            return f" {Colors.DIM}AIZU {Colors.BOLD}{model_name}{Colors.RESET} {Colors.DIM}│{Colors.RESET} {action}"
+        return full
+
+    def render_bottom_dock(self, state=None, detail=None, prompt_text=""):
+        """Kunci mati dock input & status bar di bagian paling bawah terminal."""
+        if not getattr(self, '_scroll_region_active', False):
+            return
+
+        if state is not None:
+            self._current_bottom_state = state
+        else:
+            state = getattr(self, '_current_bottom_state', 'idle')
+
+        if detail is not None:
+            self._current_bottom_detail = detail
+        else:
+            detail = getattr(self, '_current_bottom_detail', '')
+
+        with self._lock:
+            # Simpan posisi kursor saat ini (DEC cursor save \0337)
+            sys.stdout.write("\0337")
+
+            div_len = max(4, min(self.width - 1, 74))
+            div_line = f"{Colors.DIM}{'─' * div_len}{Colors.RESET}"
+
+            # 1. Top divider pembungkus kolom chat input (jika terminal >= 14 baris)
+            if getattr(self, '_has_top_border', True):
+                top_div = self.height - 3
+                sys.stdout.write(f"\033[{top_div};1H\033[2K{div_line}")
+
+            # 2. Baris kolom chat input (selalu berada di dasar, persis di atas divider bawah)
+            inp_row = getattr(self, 'input_row', self.height - 2)
+            if prompt_text:
+                sys.stdout.write(f"\033[{inp_row};1H\033[2K{prompt_text}")
+            elif state == "thinking":
+                sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.DIM}  (AIZU sedang berpikir...){Colors.RESET}")
+            elif state == "answering":
+                sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.DIM}  (AIZU sedang menjawab...){Colors.RESET}")
+            elif state == "tool":
+                t_name = detail or "tool"
+                if len(t_name) > 20:
+                    t_name = t_name[:18] + ".."
+                sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.DIM}  (AIZU sedang menjalankan {t_name}...){Colors.RESET}")
+            else:
+                sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.GREEN}{Colors.BOLD}> {Colors.RESET}")
+
+            # 3. Bottom divider
+            bot_div = self.height - 1
+            sys.stdout.write(f"\033[{bot_div};1H\033[2K{div_line}")
+
+            # 4. Status bar di baris paling bawah
+            stat_row = self.height
+            status_text = self._build_status_text(state=state, detail=detail)
+            sys.stdout.write(f"\033[{stat_row};1H\033[2K{status_text}")
+
+            # Kembalikan posisi kursor ke tempat semula (DEC cursor restore \0338)
+            sys.stdout.write("\0338")
+            sys.stdout.flush()
+
+    def render_bottom_bar(self, state=None, detail=None):
+        """Alias untuk render_bottom_dock agar kompatibel dengan seluruh pemanggil."""
+        self.render_bottom_dock(state=state, detail=detail)
 
     def _full_render(self):
         """No-op in sequential mode"""
@@ -1509,8 +1705,8 @@ class ClaudeStyleTUI:
                 for line in text_lines:
                     print(f"{Colors.GREEN}{Colors.BOLD}> {line}{Colors.RESET}")
             elif role == "assistant":
-                for line in text_lines:
-                    print(f"{Colors.WHITE}{line}{Colors.RESET}")
+                for line in self._format_markdown(text):
+                    print(line)
             elif role == "thought":
                 color = Colors.DIM + Colors.WHITE
                 for line in text_lines:
@@ -1546,7 +1742,8 @@ class ClaudeStyleTUI:
 
     def add_user_message(self, text):
         """Add user message ke riwayat tanpa mencetak ulang (karena sudah dicetak saat Enter)"""
-        self.stop_thinking()
+        if self.is_thinking:
+            self.stop_thinking()
         self.messages.append({
             "role": "user",
             "text": text,
@@ -1555,14 +1752,19 @@ class ClaudeStyleTUI:
 
     def add_assistant_message(self, text):
         """Add assistant message (menghindari duplikasi jika sudah di-stream)"""
-        self.stop_thinking()
+        if self.is_thinking:
+            self.stop_thinking()
         is_duplicate = False
         if self.messages:
             last = self.messages[-1]
             if last.get("role") == "assistant" and last.get("text") == text:
                 is_duplicate = True
         if not is_duplicate:
+            if getattr(self, '_scroll_region_active', False):
+                self.render_bottom_bar(state="answering")
             self.add_message(text, "assistant", "●")
+            if getattr(self, '_scroll_region_active', False):
+                self.render_bottom_bar(state="idle")
 
     def add_thought_duration(self, seconds, usage=None, model=None, total_usage=None):
         """Add thought duration — Claude Code style (dim, no emoji)."""
@@ -1669,12 +1871,15 @@ class ClaudeStyleTUI:
             "timestamp": time.time()
         }
         self.messages.append(churned_msg)
+        if getattr(self, '_scroll_region_active', False):
+            self.render_bottom_bar(state="idle")
         with self._lock:
             # Divider + status line like Claude Code
             divider = f"{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}"
             print(f"\n{divider}")
             print(f"{Colors.DIM}  {text}{Colors.RESET}")
-            self._render_status()
+            if not getattr(self, '_scroll_region_active', False):
+                self._render_status()
             print()
             sys.stdout.flush()
 
@@ -1690,6 +1895,8 @@ class ClaudeStyleTUI:
                 args_str = f" {args['command'][:40]}"
             elif "pattern" in args:
                 args_str = f" {args['pattern'][:30]}"
+        if getattr(self, '_scroll_region_active', False):
+            self.render_bottom_bar(state="tool", detail=tool_name)
         with self._lock:
             prefix = "  │" if self._in_tool_section else "  "
             print(f"{Colors.DIM}{Colors.CYAN}{prefix} ● {tool_name}{args_str}{Colors.RESET}")
@@ -1701,6 +1908,8 @@ class ClaudeStyleTUI:
         if result:
             result_preview = result.strip()[:60].replace('\n', ' ')
             text += f": {result_preview}"
+        if getattr(self, '_scroll_region_active', False):
+            self.render_bottom_bar(state="answering" if getattr(self, '_streaming', False) else "thinking")
         with self._lock:
             prefix = "  │" if self._in_tool_section else "  "
             print(f"{Colors.DIM}{Colors.GREEN}{prefix} ✔ {text}{Colors.RESET}")
@@ -1837,36 +2046,42 @@ class ClaudeStyleTUI:
     # Thinking Animation
     # -------------------------------------------------------------------------
     def start_thinking(self, text="Berpikir", note=""):
-        """Start thinking animation"""
+        """Start thinking animation — updates locked bottom bar with spinner."""
         self._stop_animation()
         self.is_thinking = True
         self.thinking_text = text
         self.thinking_start = time.time()
         self.frame_idx = 0
         self._stop_event = threading.Event()
+        if getattr(self, '_scroll_region_active', False):
+            self.render_bottom_bar(state="thinking")
         self.anim_thread = threading.Thread(target=self._animate, args=(self._stop_event,), daemon=True)
         self.anim_thread.start()
 
     def _animate(self, stop_event):
-        """Thinking animation thread — braille spinner like Claude Code."""
+        """Thinking animation thread — updates locked bottom bar or fallback spinner."""
         while not stop_event.is_set():
-            elapsed = int(time.time() - self.thinking_start)
-            icon = self.frames[self.frame_idx % len(self.frames)]
-
-            with self._lock:
-                sys.stdout.write(f"\r{Colors.DIM}{Colors.YELLOW}  {icon} {self.thinking_text} {elapsed}s{Colors.RESET}   ")
-                sys.stdout.flush()
-
             self.frame_idx += 1
+            if getattr(self, '_scroll_region_active', False):
+                self.render_bottom_bar(state="thinking")
+            else:
+                elapsed = int(time.time() - self.thinking_start)
+                icon = self.frames[self.frame_idx % len(self.frames)]
+                with self._lock:
+                    sys.stdout.write(f"\r{Colors.DIM}{Colors.YELLOW}  {icon} {self.thinking_text} {elapsed}s{Colors.RESET}   ")
+                    sys.stdout.flush()
             stop_event.wait(0.08)
 
     def stop_thinking(self):
         """Stop thinking animation"""
         self._stop_animation()
         self.is_thinking = False
-        with self._lock:
-            sys.stdout.write(f"\r{' ' * 60}\r")  # Clear thinking line
-            sys.stdout.flush()
+        if getattr(self, '_scroll_region_active', False):
+            self.render_bottom_bar(state="answering" if getattr(self, '_streaming', False) else "idle")
+        else:
+            with self._lock:
+                sys.stdout.write(f"\r{' ' * 60}\r")  # Clear thinking line
+                sys.stdout.flush()
 
     def _stop_animation(self):
         """Stop animation thread"""
@@ -1893,6 +2108,9 @@ class ClaudeStyleTUI:
             "timestamp": time.time()
         })
 
+        if getattr(self, '_scroll_region_active', False):
+            self.render_bottom_bar(state="answering")
+
         with self._lock:
             sys.stdout.write(Colors.WHITE)
             sys.stdout.flush()
@@ -1905,6 +2123,8 @@ class ClaudeStyleTUI:
         # Stop thinking animation saat token pertama tiba
         if not self._stream_buffer and self.is_thinking:
             self.stop_thinking()
+            if getattr(self, '_scroll_region_active', False):
+                self.render_bottom_bar(state="answering")
             # Baris baru sebelum output assistant
             with self._lock:
                 sys.stdout.write("\n")
@@ -1925,6 +2145,8 @@ class ClaudeStyleTUI:
         if self.messages:
             self.messages[-1]["text"] = self._stream_buffer
         self._stream_buffer = ""
+        if getattr(self, '_scroll_region_active', False):
+            self.render_bottom_bar(state="idle")
         with self._lock:
             print() # Print newline to finish assistant block
             sys.stdout.flush()
@@ -1988,16 +2210,22 @@ class ClaudeStyleTUI:
         if model is not None:
             self.status_info["model"] = model
             self.model = model
-        with self._lock:
-            self._render_status()
-            sys.stdout.flush()
+        if getattr(self, '_scroll_region_active', False):
+            self.render_bottom_bar()
+        else:
+            with self._lock:
+                self._render_status()
+                sys.stdout.flush()
 
     def update_tokens(self, count):
         """Update token count"""
         self.status_info["tokens"] = count
-        with self._lock:
-            self._render_status()
-            sys.stdout.flush()
+        if getattr(self, '_scroll_region_active', False):
+            self.render_bottom_bar()
+        else:
+            with self._lock:
+                self._render_status()
+                sys.stdout.flush()
 
     # -------------------------------------------------------------------------
     # Header Methods
@@ -2010,9 +2238,12 @@ class ClaudeStyleTUI:
         if model:
             self.model = model
             self.status_info["model"] = model
-        with self._lock:
-            self._render_header()
-            sys.stdout.flush()
+        if getattr(self, '_scroll_region_active', False):
+            self.render_bottom_bar()
+        else:
+            with self._lock:
+                self._render_header()
+                sys.stdout.flush()
 
     def show_plan_mode(self, enabled):
         """Toggle plan mode indicator di header"""
@@ -2040,78 +2271,100 @@ class ClaudeStyleTUI:
     def _input_windows(self):
         """Input dengan suggestions di Windows — Claude Code style.
 
-        Layout (suggestions muncul di bawah divider, bukan di atas):
-          ──────────────────────  (top divider)
-            /help  Bantuan        (suggestions, jika ada)
-            /config  Konfigurasi
-          > /h_                   (prompt + cursor)
-          ──────────────────────  (bottom divider)
-            ? untuk bantuan
+        Kolom chat input SELALU terkunci di baris self.input_row (bawah layar).
         """
-        with self._lock:
-            # Tampilkan top divider
-            sys.stdout.write(f"{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
-            sys.stdout.flush()
-
         if not sys.stdin.isatty():
             return input()
 
         import msvcrt
 
+        if not getattr(self, '_scroll_region_active', False):
+            with self._lock:
+                sys.stdout.write(f"{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
+                sys.stdout.flush()
+
+        inp_row = getattr(self, 'input_row', self.height - 2)
         buf = ""
         sel = -1
-        # Track cursor position: how many lines below top divider the cursor sits
-        self._cursor_below_top = 0  # 0 = right after top divider
+        prev_sug_count = 0
 
         def _visible_buf():
-            max_chars = self.width - 4
+            max_chars = self.width - 6
             if len(buf) <= max_chars:
                 return buf
             return "…" + buf[-(max_chars - 1):]
 
         def render_all():
+            nonlocal prev_sug_count
             sug = self._match_commands(buf)
             display_buf = _visible_buf()
 
             with self._lock:
-                # Move cursor back to right after top divider
-                if self._cursor_below_top > 0:
-                    sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
-                sys.stdout.write("\r" + ANSI.clear_to_end())
+                if getattr(self, '_scroll_region_active', False):
+                    # 1. Bersihkan baris suggestion sebelumnya
+                    if prev_sug_count > 0:
+                        offset = 1 if getattr(self, '_has_top_border', True) else 0
+                        for r in range(inp_row - prev_sug_count - offset, inp_row - offset):
+                            if r >= 1:
+                                sys.stdout.write(f"\033[{r};1H\033[2K")
+                        if getattr(self, '_has_top_border', True):
+                            div_len = max(4, min(self.width - 1, 74))
+                            sys.stdout.write(f"\033[{inp_row - 1};1H\033[2K{Colors.DIM}{'─' * div_len}{Colors.RESET}")
+                        prev_sug_count = 0
 
-                # Write suggestions (if any)
-                lines_written = 0
-                if sug:
-                    for i, (cmd, desc) in enumerate(sug):
-                        if i == sel:
-                            sys.stdout.write(f"  {Colors.BG_LIGHT_GRAY}{Colors.WHITE} {cmd}  {desc} {Colors.RESET}\n")
-                        else:
-                            sys.stdout.write(f"  {Colors.VIOLET}{cmd}{Colors.RESET}  {Colors.DIM}{desc}{Colors.RESET}\n")
-                        lines_written += 1
+                    # 2. Gambar suggestion baru tepat di atas kolom chat input
+                    if sug:
+                        num_sug = len(sug)
+                        offset = 1 if getattr(self, '_has_top_border', True) else 0
+                        for i, (cmd, desc) in enumerate(sug):
+                            r = inp_row - num_sug + i - offset
+                            if r >= 1:
+                                if i == sel:
+                                    sys.stdout.write(f"\033[{r};1H\033[2K  {Colors.BG_LIGHT_GRAY}{Colors.WHITE} {cmd}  {desc} {Colors.RESET}")
+                                else:
+                                    sys.stdout.write(f"\033[{r};1H\033[2K  {Colors.VIOLET}{cmd}{Colors.RESET}  {Colors.DIM}{desc}{Colors.RESET}")
+                        prev_sug_count = num_sug
 
-                # Write prompt line
-                sys.stdout.write(f"{Colors.GREEN}{Colors.BOLD}> {Colors.RESET}{Colors.WHITE}{display_buf}")
-                prompt_line = lines_written  # prompt is at this line offset from top
-                lines_written += 1
+                    # 3. Gambar prompt di inp_row (terkunci di dasar layar)
+                    prompt_str = f"{Colors.GREEN}{Colors.BOLD}> {Colors.RESET}{Colors.WHITE}{display_buf}"
+                    sys.stdout.write(f"\033[{inp_row};1H\033[2K{prompt_str}")
 
-                # Bottom divider + help
-                sys.stdout.write(f"\n{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
-                sys.stdout.write(f"  {Colors.DIM}? untuk bantuan · /help untuk perintah{Colors.RESET}")
-                lines_written += 2  # divider + help
+                    # 4. Posisikan kursor tepat di belakang input
+                    cursor_col = 3 + len(display_buf)
+                    sys.stdout.write(f"\033[{inp_row};{cursor_col}H")
+                    sys.stdout.flush()
 
-                # Move cursor back to prompt line
-                lines_below_prompt = lines_written - prompt_line - 1
-                if lines_below_prompt > 0:
-                    sys.stdout.write(ANSI.cursor_up(lines_below_prompt))
-                cursor_col = 2 + len(display_buf)
-                sys.stdout.write("\r")
-                if cursor_col > 0:
-                    sys.stdout.write(f"\033[{cursor_col}C")
+                else:
+                    if hasattr(self, '_cursor_below_top') and self._cursor_below_top > 0:
+                        sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
+                    sys.stdout.write("\r" + ANSI.clear_to_end())
 
-                # Cursor is now at prompt line = prompt_line lines below top divider
-                self._cursor_below_top = prompt_line
+                    lines_written = 0
+                    if sug:
+                        for i, (cmd, desc) in enumerate(sug):
+                            if i == sel:
+                                sys.stdout.write(f"  {Colors.BG_LIGHT_GRAY}{Colors.WHITE} {cmd}  {desc} {Colors.RESET}\n")
+                            else:
+                                sys.stdout.write(f"  {Colors.VIOLET}{cmd}{Colors.RESET}  {Colors.DIM}{desc}{Colors.RESET}\n")
+                            lines_written += 1
 
-                sys.stdout.flush()
+                    sys.stdout.write(f"{Colors.GREEN}{Colors.BOLD}> {Colors.RESET}{Colors.WHITE}{display_buf}")
+                    prompt_line = lines_written
+                    lines_written += 1
+
+                    sys.stdout.write(f"\n{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
+                    sys.stdout.write(self._get_footer_text())
+                    lines_written += 2
+                    lines_below_prompt = lines_written - prompt_line - 1
+                    if lines_below_prompt > 0:
+                        sys.stdout.write(ANSI.cursor_up(lines_below_prompt))
+
+                    cursor_col = 2 + len(display_buf)
+                    sys.stdout.write("\r")
+                    if cursor_col > 0:
+                        sys.stdout.write(f"\033[{cursor_col}C")
+                    self._cursor_below_top = prompt_line
+                    sys.stdout.flush()
 
         render_all()
 
@@ -2124,17 +2377,37 @@ class ClaudeStyleTUI:
                     if sug and 0 <= sel < len(sug):
                         buf = sug[sel][0]
                     with self._lock:
-                        # Move to right after top divider, clear everything
-                        if self._cursor_below_top > 0:
-                            sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
-                        sys.stdout.write("\r" + ANSI.clear_to_end())
-                        # Also clear top divider (1 line above)
-                        sys.stdout.write(ANSI.cursor_up(1))
-                        sys.stdout.write("\r" + ANSI.clear_to_end())
-                        # Print user message as chat history
-                        print(f"{Colors.GREEN}{Colors.BOLD}> {buf}{Colors.RESET}")
-                        sys.stdout.flush()
-                        self._cursor_below_top = 0
+                        if getattr(self, '_scroll_region_active', False):
+                            if prev_sug_count > 0:
+                                offset = 1 if getattr(self, '_has_top_border', True) else 0
+                                for r in range(inp_row - prev_sug_count - offset, inp_row - offset):
+                                    if r >= 1:
+                                        sys.stdout.write(f"\033[{r};1H\033[2K")
+                                if getattr(self, '_has_top_border', True):
+                                    div_len = max(4, min(self.width - 1, 74))
+                                    sys.stdout.write(f"\033[{inp_row - 1};1H\033[2K{Colors.DIM}{'─' * div_len}{Colors.RESET}")
+                                prev_sug_count = 0
+
+                            # Update baris input menjadi status berpikir
+                            sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.DIM}  (AIZU sedang berpikir...){Colors.RESET}")
+
+                            # Commit pesan ke area scroll chat di atas
+                            if buf.strip():
+                                scr_bot = getattr(self, 'scroll_bottom', self.height - 4)
+                                sys.stdout.write(f"\033[{scr_bot};1H\n{Colors.GREEN}{Colors.BOLD}> {buf}{Colors.RESET}\n")
+                            sys.stdout.flush()
+                        else:
+                            if hasattr(self, '_cursor_below_top') and self._cursor_below_top > 0:
+                                sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
+                            sys.stdout.write("\r" + ANSI.clear_to_end())
+                            sys.stdout.write(ANSI.cursor_up(1))
+                            sys.stdout.write("\r" + ANSI.clear_to_end())
+                            print(f"{Colors.GREEN}{Colors.BOLD}> {buf}{Colors.RESET}")
+                            sys.stdout.flush()
+                            self._cursor_below_top = 0
+
+                    if getattr(self, '_scroll_region_active', False):
+                        self.render_bottom_dock(state="thinking")
                     return buf
 
                 elif ch == '\x03':
@@ -2180,79 +2453,100 @@ class ClaudeStyleTUI:
                 time.sleep(0.02)
 
     def _input_unix(self):
-        """Input dengan suggestions di Unix — Claude Code style.
+        """Input dengan suggestions di Unix / Android Termux — Claude Code style.
 
-        Layout (suggestions di bawah divider, bukan di atas):
-          ──────────────────────  (top divider)
-            /help  Bantuan        (suggestions, jika ada)
-            /config  Konfigurasi
-          > /h_                   (prompt + cursor)
-          ──────────────────────  (bottom divider)
-            ? untuk bantuan
+        Kolom chat input SELALU terkunci di baris self.input_row (bawah layar).
         """
         import termios
         import tty
 
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return input()
+
+        if not getattr(self, '_scroll_region_active', False):
             with self._lock:
                 sys.stdout.write(f"{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
                 sys.stdout.flush()
-            return input()
 
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
+        inp_row = getattr(self, 'input_row', self.height - 2)
         buf = ""
         sel = -1
-        self._cursor_below_top = 0
+        prev_sug_count = 0
 
         def _visible_buf():
-            max_chars = self.width - 4
+            max_chars = self.width - 6
             if len(buf) <= max_chars:
                 return buf
             return "…" + buf[-(max_chars - 1):]
 
         def render_all():
+            nonlocal prev_sug_count
             sug = self._match_commands(buf)
             display_buf = _visible_buf()
 
             with self._lock:
-                # Move cursor back to right after top divider
-                if self._cursor_below_top > 0:
-                    sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
-                sys.stdout.write("\r" + ANSI.clear_to_end())
+                if getattr(self, '_scroll_region_active', False):
+                    if prev_sug_count > 0:
+                        offset = 1 if getattr(self, '_has_top_border', True) else 0
+                        for r in range(inp_row - prev_sug_count - offset, inp_row - offset):
+                            if r >= 1:
+                                sys.stdout.write(f"\033[{r};1H\033[2K")
+                        if getattr(self, '_has_top_border', True):
+                            div_len = max(4, min(self.width - 1, 74))
+                            sys.stdout.write(f"\033[{inp_row - 1};1H\033[2K{Colors.DIM}{'─' * div_len}{Colors.RESET}")
+                        prev_sug_count = 0
 
-                # Write suggestions (if any)
-                lines_written = 0
-                if sug:
-                    for i, (cmd, desc) in enumerate(sug):
-                        if i == sel:
-                            sys.stdout.write(f"  {Colors.BG_LIGHT_GRAY}{Colors.WHITE} {cmd}  {desc} {Colors.RESET}\n")
-                        else:
-                            sys.stdout.write(f"  {Colors.VIOLET}{cmd}{Colors.RESET}  {Colors.DIM}{desc}{Colors.RESET}\n")
-                        lines_written += 1
+                    if sug:
+                        num_sug = len(sug)
+                        offset = 1 if getattr(self, '_has_top_border', True) else 0
+                        for i, (cmd, desc) in enumerate(sug):
+                            r = inp_row - num_sug + i - offset
+                            if r >= 1:
+                                if i == sel:
+                                    sys.stdout.write(f"\033[{r};1H\033[2K  {Colors.BG_LIGHT_GRAY}{Colors.WHITE} {cmd}  {desc} {Colors.RESET}")
+                                else:
+                                    sys.stdout.write(f"\033[{r};1H\033[2K  {Colors.VIOLET}{cmd}{Colors.RESET}  {Colors.DIM}{desc}{Colors.RESET}")
+                        prev_sug_count = num_sug
 
-                # Write prompt
-                sys.stdout.write(f"{Colors.GREEN}{Colors.BOLD}> {Colors.RESET}{Colors.WHITE}{display_buf}")
-                prompt_line = lines_written
-                lines_written += 1
+                    prompt_str = f"{Colors.GREEN}{Colors.BOLD}> {Colors.RESET}{Colors.WHITE}{display_buf}"
+                    sys.stdout.write(f"\033[{inp_row};1H\033[2K{prompt_str}")
 
-                # Bottom divider + help
-                sys.stdout.write(f"\n{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
-                sys.stdout.write(f"  {Colors.DIM}? untuk bantuan · /help untuk perintah{Colors.RESET}")
-                lines_written += 2
+                    cursor_col = 3 + len(display_buf)
+                    sys.stdout.write(f"\033[{inp_row};{cursor_col}H")
+                    sys.stdout.flush()
+                else:
+                    if hasattr(self, '_cursor_below_top') and self._cursor_below_top > 0:
+                        sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
+                    sys.stdout.write("\r" + ANSI.clear_to_end())
 
-                # Move cursor back to prompt line
-                lines_below_prompt = lines_written - prompt_line - 1
-                if lines_below_prompt > 0:
-                    sys.stdout.write(ANSI.cursor_up(lines_below_prompt))
-                cursor_col = 2 + len(display_buf)
-                sys.stdout.write("\r")
-                if cursor_col > 0:
-                    sys.stdout.write(f"\033[{cursor_col}C")
+                    lines_written = 0
+                    if sug:
+                        for i, (cmd, desc) in enumerate(sug):
+                            if i == sel:
+                                sys.stdout.write(f"  {Colors.BG_LIGHT_GRAY}{Colors.WHITE} {cmd}  {desc} {Colors.RESET}\n")
+                            else:
+                                sys.stdout.write(f"  {Colors.VIOLET}{cmd}{Colors.RESET}  {Colors.DIM}{desc}{Colors.RESET}\n")
+                            lines_written += 1
 
-                self._cursor_below_top = prompt_line
+                    sys.stdout.write(f"{Colors.GREEN}{Colors.BOLD}> {Colors.RESET}{Colors.WHITE}{display_buf}")
+                    prompt_line = lines_written
+                    lines_written += 1
 
-                sys.stdout.flush()
+                    sys.stdout.write(f"\n{Colors.DIM}{'─' * min(self.width, 72)}{Colors.RESET}\n")
+                    sys.stdout.write(self._get_footer_text())
+                    lines_written += 2
+                    lines_below_prompt = lines_written - prompt_line - 1
+                    if lines_below_prompt > 0:
+                        sys.stdout.write(ANSI.cursor_up(lines_below_prompt))
+
+                    cursor_col = 2 + len(display_buf)
+                    sys.stdout.write("\r")
+                    if cursor_col > 0:
+                        sys.stdout.write(f"\033[{cursor_col}C")
+                    self._cursor_below_top = prompt_line
+                    sys.stdout.flush()
 
         try:
             tty.setcbreak(fd)
@@ -2264,15 +2558,35 @@ class ClaudeStyleTUI:
                     if sug and 0 <= sel < len(sug):
                         buf = sug[sel][0]
                     with self._lock:
-                        if self._cursor_below_top > 0:
-                            sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
-                        sys.stdout.write("\r" + ANSI.clear_to_end())
-                        # Also clear top divider
-                        sys.stdout.write(ANSI.cursor_up(1))
-                        sys.stdout.write("\r" + ANSI.clear_to_end())
-                        print(f"{Colors.GREEN}{Colors.BOLD}> {buf}{Colors.RESET}")
-                        sys.stdout.flush()
-                        self._cursor_below_top = 0
+                        if getattr(self, '_scroll_region_active', False):
+                            if prev_sug_count > 0:
+                                offset = 1 if getattr(self, '_has_top_border', True) else 0
+                                for r in range(inp_row - prev_sug_count - offset, inp_row - offset):
+                                    if r >= 1:
+                                        sys.stdout.write(f"\033[{r};1H\033[2K")
+                                if getattr(self, '_has_top_border', True):
+                                    div_len = max(4, min(self.width - 1, 74))
+                                    sys.stdout.write(f"\033[{inp_row - 1};1H\033[2K{Colors.DIM}{'─' * div_len}{Colors.RESET}")
+                                prev_sug_count = 0
+
+                            sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.DIM}  (AIZU sedang berpikir...){Colors.RESET}")
+
+                            if buf.strip():
+                                scr_bot = getattr(self, 'scroll_bottom', self.height - 4)
+                                sys.stdout.write(f"\033[{scr_bot};1H\n{Colors.GREEN}{Colors.BOLD}> {buf}{Colors.RESET}\n")
+                            sys.stdout.flush()
+                        else:
+                            if hasattr(self, '_cursor_below_top') and self._cursor_below_top > 0:
+                                sys.stdout.write(ANSI.cursor_up(self._cursor_below_top))
+                            sys.stdout.write("\r" + ANSI.clear_to_end())
+                            sys.stdout.write(ANSI.cursor_up(1))
+                            sys.stdout.write("\r" + ANSI.clear_to_end())
+                            print(f"{Colors.GREEN}{Colors.BOLD}> {buf}{Colors.RESET}")
+                            sys.stdout.flush()
+                            self._cursor_below_top = 0
+
+                    if getattr(self, '_scroll_region_active', False):
+                        self.render_bottom_dock(state="thinking")
                     return buf
                 elif ch == '\x03':
                     raise KeyboardInterrupt
@@ -2316,10 +2630,95 @@ class ClaudeStyleTUI:
 
     @staticmethod
     def _match_commands(buf):
-        """Cari command yang cocok dengan teks yang sedang diketik."""
+        """Cari command yang cocok dengan teks yang sedang diketik, termasuk sub-argumen."""
         if not buf.startswith('/'):
             return []
         low = buf.lower()
+
+        # Autocomplete parameter file=
+        if "file=" in low:
+            prefix = buf[:buf.rfind("file=") + 5]
+            val = buf[len(prefix):]
+            try:
+                import os
+                d = os.path.dirname(val) or "."
+                f_prefix = os.path.basename(val)
+                files = os.listdir(d)
+                results = []
+                for f in sorted(files):
+                    if f.startswith(".") and not f_prefix.startswith("."):
+                        continue
+                    if f.lower().startswith(f_prefix.lower()):
+                        full = os.path.normpath(os.path.join(d, f)).replace("\\", "/")
+                        if full.startswith("./"):
+                            full = full[2:]
+                        results.append((f"{prefix}{full}", "file"))
+                if results:
+                    return results[:MAX_SUGGEST]
+            except Exception:
+                pass
+
+        # Sub-command matching untuk /mode
+        if low.startswith('/mode '):
+            arg = low[6:].strip()
+            modes = [
+                ("chat", "asisten umum (default)"),
+                ("code", "fokus menulis & memperbaiki kode"),
+                ("ringkas", "jawaban sesingkat mungkin"),
+                ("shell", "utamakan perintah shell"),
+                ("detail", "jawaban lengkap & mendalam"),
+                ("git", "fokus pada pekerjaan Git"),
+            ]
+            return [(f"/mode {m}", desc) for m, desc in modes if m.startswith(arg)][:MAX_SUGGEST]
+
+        # Sub-command matching untuk /skill
+        if low.startswith('/skill '):
+            arg = low[7:].strip()
+            skills = [
+                ("review-code", "review kualitas kode & bug"),
+                ("explain-code", "jelaskan alur kerja kode"),
+                ("debug", "analisis error dan berikan solusi"),
+                ("write-tests", "buat unit test otomatis"),
+                ("refactor", "refactor kode jadi lebih bersih"),
+                ("commit", "buat git commit message cerdas"),
+                ("docs", "buat dokumentasi fungsi / modul"),
+            ]
+            return [(f"/skill {s}", desc) for s, desc in skills if s.startswith(arg)][:MAX_SUGGEST]
+
+        # Sub-command matching untuk /backend
+        if low.startswith('/backend '):
+            arg = low[9:].strip()
+            backends = [
+                ("groq", "Groq Cloud (cepat, free tier)"),
+                ("gemini", "Google Gemini API"),
+                ("openai", "OpenAI GPT models"),
+                ("openrouter", "OpenRouter multi-model"),
+                ("ollama", "Ollama lokal (offline di HP/PC)"),
+                ("custom", "Custom endpoint OpenAI-compatible"),
+            ]
+            return [(f"/backend {b}", desc) for b, desc in backends if b.startswith(arg)][:MAX_SUGGEST]
+
+        # Sub-command matching untuk /memory
+        if low.startswith('/memory '):
+            arg = low[8:].strip()
+            mem_cmds = [
+                ("list", "tampilkan semua memori tersimpan"),
+                ("search ", "cari memori berdasarkan kata kunci"),
+                ("save ", "simpan memori baru (/memory save <nama> <isi>)"),
+                ("delete ", "hapus memori berdasarkan nama"),
+            ]
+            return [(f"/memory {m}", desc) for m, desc in mem_cmds if m.startswith(arg)][:MAX_SUGGEST]
+
+        # Sub-command matching untuk /tasks
+        if low.startswith('/tasks '):
+            arg = low[7:].strip()
+            task_cmds = [
+                ("list", "tampilkan daftar task aktif"),
+                ("create ", "buat task baru (/tasks create <deskripsi>)"),
+                ("update ", "update status task (/tasks update <id> <status>)"),
+            ]
+            return [(f"/tasks {t}", desc) for t, desc in task_cmds if t.startswith(arg)][:MAX_SUGGEST]
+
         return [(c, h) for c, h in COMMANDS if c.startswith(low)][:MAX_SUGGEST]
 
     # -------------------------------------------------------------------------
@@ -2366,3 +2765,93 @@ class ClaudeStyleTUI:
                 lines.append(current_line)
 
         return lines if lines else [""]
+
+    def _format_markdown(self, text):
+        """Format markdown dengan warna ANSI untuk keterbacaan tinggi di terminal."""
+        import re
+        lines = text.split('\n')
+        formatted = []
+        in_code_block = False
+        code_lang = ""
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Code block ```lang
+            if stripped.startswith('```'):
+                if not in_code_block:
+                    in_code_block = True
+                    code_lang = stripped[3:].strip()
+                    lang_tag = f" ({code_lang})" if code_lang else ""
+                    border_w = max(4, min(self.width, 70) - len(lang_tag) - 8)
+                    formatted.append(f"{Colors.DIM}  ╭── code{lang_tag} {'─' * border_w}{Colors.RESET}")
+                else:
+                    in_code_block = False
+                    border_w = max(4, min(self.width, 70) - 4)
+                    formatted.append(f"{Colors.DIM}  ╰{'─' * border_w}{Colors.RESET}")
+                continue
+
+            if in_code_block:
+                formatted.append(f"{Colors.DIM}  │ {Colors.RESET}\033[38;5;153m{line}{Colors.RESET}")
+                continue
+
+            # Headers (#, ##, ###)
+            if stripped.startswith('### '):
+                formatted.append(f"\033[1;33m◆ {stripped[4:]}{Colors.RESET}")
+                continue
+            elif stripped.startswith('## '):
+                formatted.append(f"\n{Colors.BOLD}{Colors.VIOLET}■ {stripped[3:]}{Colors.RESET}")
+                continue
+            elif stripped.startswith('# '):
+                formatted.append(f"\n{Colors.BOLD}{Colors.CYAN}━ {stripped[2:]} ━{Colors.RESET}")
+                continue
+
+            # Blockquote
+            if stripped.startswith('> '):
+                formatted.append(f"{Colors.DIM}  │ {Colors.RESET}{Colors.DIM}{stripped[2:]}{Colors.RESET}")
+                continue
+
+            # Bullet points (- / *)
+            if stripped.startswith(('- ', '* ')):
+                bullet_body = stripped[2:]
+                bullet_body = re.sub(r'`([^`]+)`', rf'{Colors.CYAN}`\1`{Colors.RESET}', bullet_body)
+                bullet_body = re.sub(r'\*\*([^*]+)\*\*', rf'{Colors.BOLD}\1{Colors.RESET}', bullet_body)
+                formatted.append(f"  {Colors.CYAN}•{Colors.RESET} {bullet_body}")
+                continue
+
+            # Numbered list
+            m_num = re.match(r'^(\d+)\.\s+(.*)$', stripped)
+            if m_num:
+                num, num_body = m_num.groups()
+                num_body = re.sub(r'`([^`]+)`', rf'{Colors.CYAN}`\1`{Colors.RESET}', num_body)
+                num_body = re.sub(r'\*\*([^*]+)\*\*', rf'{Colors.BOLD}\1{Colors.RESET}', num_body)
+                formatted.append(f"  {Colors.CYAN}{num}.{Colors.RESET} {num_body}")
+                continue
+
+            # Normal line with inline bold and inline code
+            normal_line = line
+            normal_line = re.sub(r'`([^`]+)`', rf'{Colors.CYAN}`\1`{Colors.RESET}', normal_line)
+            normal_line = re.sub(r'\*\*([^*]+)\*\*', rf'{Colors.BOLD}\1{Colors.RESET}', normal_line)
+            formatted.append(f"{Colors.WHITE}{normal_line}{Colors.RESET}")
+
+        return formatted
+
+    def _get_footer_text(self):
+        """Buat footer teks status informatif & ringkas."""
+        model_name = self.model.split("/")[-1] if self.model else "aizu"
+        if len(model_name) > 18:
+            model_name = model_name[:16] + ".."
+        mode_name = self.mode if hasattr(self, 'mode') and self.mode else "chat"
+        # Cek branch git jika ada
+        branch = ""
+        git_head = os.path.join(self.workspace_path, ".git", "HEAD")
+        if os.path.isfile(git_head):
+            try:
+                with open(git_head, "r", encoding="utf-8") as f:
+                    ref = f.read().strip()
+                if ref.startswith("ref: refs/heads/"):
+                    branch = ref[16:]
+            except Exception:
+                pass
+        branch_tag = f" · {Colors.CYAN}{branch}{Colors.DIM}" if branch else ""
+        return f"  {Colors.DIM}? bantuan · /help · {model_name} · [{mode_name}]{branch_tag}{Colors.RESET}"
