@@ -1140,8 +1140,9 @@ class ClaudeStyleTUI:
         """Update terminal dimensions"""
         try:
             size = os.get_terminal_size()
-            self.width = size.columns
-            self.height = size.lines
+            # Guard: ukuran 0/degenerate (mis. PTY tanpa winsize) -> fallback aman
+            self.width = size.columns if size.columns >= 20 else 80
+            self.height = size.lines if size.lines >= 10 else 24
         except (OSError, ValueError):
             self.width = 80
             self.height = 24
@@ -1524,14 +1525,22 @@ class ClaudeStyleTUI:
             if prompt_text:
                 sys.stdout.write(f"\033[{inp_row};1H\033[2K{prompt_text}")
             elif state == "thinking":
-                sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.DIM}  (AIZU sedang berpikir...){Colors.RESET}")
+                _frames = getattr(self, 'frames', ["⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","⠋"])
+                _icon = _frames[getattr(self, 'frame_idx', 0) % len(_frames)]
+                _t0 = getattr(self, 'thinking_start', None)
+                _elapsed = int(time.time() - _t0) if _t0 else 0
+                sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.YELLOW}  {_icon} Berpikir... {_elapsed}s{Colors.RESET}")
             elif state == "answering":
-                sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.DIM}  (AIZU sedang menjawab...){Colors.RESET}")
+                _frames = getattr(self, 'frames', ["⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","⠋"])
+                _icon = _frames[getattr(self, 'frame_idx', 0) % len(_frames)]
+                sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.GREEN}  {_icon} Menjawab...{Colors.RESET}")
             elif state == "tool":
                 t_name = detail or "tool"
                 if len(t_name) > 20:
                     t_name = t_name[:18] + ".."
-                sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.DIM}  (AIZU sedang menjalankan {t_name}...){Colors.RESET}")
+                _frames = getattr(self, 'frames', ["⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","⠋"])
+                _icon = _frames[getattr(self, 'frame_idx', 0) % len(_frames)]
+                sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.CYAN}  {_icon} Menjalankan {t_name}...{Colors.RESET}")
             else:
                 sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.GREEN}{Colors.BOLD}> {Colors.RESET}")
 
@@ -2112,6 +2121,11 @@ class ClaudeStyleTUI:
             self.render_bottom_bar(state="answering")
 
         with self._lock:
+            if getattr(self, '_scroll_region_active', False):
+                # Amankan cursor ke area scroll sebelum token ditulis,
+                # supaya tidak menimpa dock input/status di bawah.
+                scr_bot = getattr(self, 'scroll_bottom', self.height - 4)
+                sys.stdout.write(f"\033[{scr_bot};1H")
             sys.stdout.write(Colors.WHITE)
             sys.stdout.flush()
 
@@ -2389,7 +2403,7 @@ class ClaudeStyleTUI:
                                 prev_sug_count = 0
 
                             # Update baris input menjadi status berpikir
-                            sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.DIM}  (AIZU sedang berpikir...){Colors.RESET}")
+                            sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.YELLOW}  ⠙ Berpikir...{Colors.RESET}")
 
                             # Commit pesan ke area scroll chat di atas
                             if buf.strip():
@@ -2569,7 +2583,7 @@ class ClaudeStyleTUI:
                                     sys.stdout.write(f"\033[{inp_row - 1};1H\033[2K{Colors.DIM}{'─' * div_len}{Colors.RESET}")
                                 prev_sug_count = 0
 
-                            sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.DIM}  (AIZU sedang berpikir...){Colors.RESET}")
+                            sys.stdout.write(f"\033[{inp_row};1H\033[2K{Colors.YELLOW}  ⠙ Berpikir...{Colors.RESET}")
 
                             if buf.strip():
                                 scr_bot = getattr(self, 'scroll_bottom', self.height - 4)
