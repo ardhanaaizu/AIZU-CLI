@@ -1,0 +1,4 @@
+#!/bin/bash
+# AIZU-CLI launcher untuk Linux/macOS (mirip aizu.bat di Windows)
+cd "$(dirname "$0")"
+python3 agent.py "$@"

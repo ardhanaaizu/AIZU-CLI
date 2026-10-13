@@ -1049,6 +1049,7 @@ SLASH_HELP = """Perintah yang tersedia:
   /skill <name> [args] invoke skill template
   /schedule            lihat/tambah scheduled tasks
   /schedule add <cron> <prompt> tambah scheduled task
+  /update              cek & unduh versi terbaru dari GitHub
   /keluar              keluar dari agent
 
 Tool yang tersedia:
@@ -1273,6 +1274,64 @@ def prompt_with_completion(prompt_text, visible_len):
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+# =============================================================================
+# Auto-Update (cek & unduh versi terbaru dari GitHub)
+# =============================================================================
+UPDATE_REPO = "ardhanaaizu/AIZU-CLI"
+UPDATE_BRANCH = "main"
+
+def _git_run(args, timeout=15):
+    """Jalankan git di folder agent.py. Return (ok, output)."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git"] + args,
+            capture_output=True, text=True, timeout=timeout,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        return r.returncode == 0, (r.stdout or r.stderr or "").strip()
+    except Exception as e:
+        return False, str(e)
+
+
+def get_local_commit():
+    """Hash commit lokal (7 char) atau '' jika bukan repo git."""
+    ok, out = _git_run(["rev-parse", "HEAD"])
+    return out[:7] if ok and out else ""
+
+
+def get_remote_commit():
+    """Hash commit terbaru di GitHub (7 char) atau '' jika offline/gagal."""
+    ok, out = _git_run(["ls-remote", f"https://github.com/{UPDATE_REPO}", "HEAD"], timeout=12)
+    if ok and out:
+        return out.split()[0][:7]
+    return ""
+
+
+def check_for_updates():
+    """Cek apakah ada update. Return (ada_update, lokal, remote, pesan)."""
+    local = get_local_commit()
+    if not local:
+        return False, "", "", "Folder ini bukan repo git — update otomatis tidak tersedia."
+    remote = get_remote_commit()
+    if not remote:
+        return False, local, "", "Tidak bisa cek update (offline atau GitHub tidak terjangkau)."
+    if local != remote:
+        return True, local, remote, f"Update tersedia: {local} → {remote}"
+    return False, local, remote, f"Sudah versi terbaru ({local})."
+
+
+def do_update():
+    """Tarik update dari GitHub (fast-forward only). Return (ok, pesan)."""
+    # Amankan perubahan lokal bila ada supaya pull tidak gagal
+    _git_run(["stash", "push", "-m", "aizu-auto-update"], timeout=15)
+    ok, out = _git_run(["pull", "--ff-only", "origin", UPDATE_BRANCH], timeout=120)
+    if ok:
+        new = get_local_commit()
+        return True, f"Berhasil update ke {new}. Restart AIZU-CLI untuk memakai versi baru."
+    return False, f"Gagal update: {out[:300]}"
+
+
 def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None, memory_mgr=None, skill_mgr=None, scheduler=None):
     """Tangani perintah slash. Return True jika program harus berhenti.
 
@@ -1306,6 +1365,18 @@ def handle_slash(line, cfg, messages, plugin_mgr=None, hook_mgr=None, tui=None, 
     if cmd in ("/keluar", "/exit", "/quit"):
         tui_print("Daah!")
         return True
+    elif cmd == "/update":
+        tui_print("Mengecek update dari GitHub...", style="info")
+        ada, lokal, remote, pesan = check_for_updates()
+        if ada:
+            tui_print(f"Update tersedia: {lokal} → {remote}", style="warning")
+            tui_print("Mengunduh update...", style="info")
+            ok, umsg = do_update()
+            tui_print(umsg, style="success" if ok else "error")
+        elif remote:
+            tui_print(pesan, style="success")
+        else:
+            tui_print(pesan, style="error")
     elif cmd in ("/help", "/?"):
         tui_print(SLASH_HELP)
         # Tampilkan plugin commands jika ada
@@ -2883,6 +2954,16 @@ def chat_loop(cfg):
         if PRESETS[cfg["backend"]]["needs_key"] and not cfg["api_key"]:
             tui.add_error("API key belum diatur. Atur dengan: /key <api-key>")
 
+        # Auto-detect update di background (non-blocking, tidak menunda startup)
+        def _bg_update_check():
+            try:
+                ada, _lokal, _remote, _pesan = check_for_updates()
+                if ada:
+                    tui.add_warning(f"Update tersedia: {_lokal} → {_remote}. Ketik /update untuk memperbarui.")
+            except Exception:
+                pass
+        threading.Thread(target=_bg_update_check, daemon=True).start()
+
         messages = [{"role": "system", "content": build_system_prompt(mode)}]
         total_usage = {"prompt": 0, "completion": 0, "total": 0}
 
@@ -3285,6 +3366,14 @@ def choose_backend_interactive(cfg):
 
 
 if __name__ == "__main__":
+    # CLI: python agent.py update  → cek & unduh versi terbaru lalu keluar
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "update":
+        ada, lokal, remote, pesan = check_for_updates()
+        print(pesan)
+        if ada:
+            ok, umsg = do_update()
+            print(umsg)
+        sys.exit(0)
     config = load_config()
     # Jalankan menu pemilihan hanya saat belum ada config & tidak dipaksa lewat env var.
     first_run = not os.path.exists(CONFIG_PATH) and "AGENT_BACKEND" not in os.environ
