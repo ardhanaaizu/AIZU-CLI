@@ -595,6 +595,29 @@ def set_plan_content(content):
     _plan_content = content
 
 
+def prune_old_tool_results(messages, keep_last_n=8):
+    """Ringkas hasil tool yang sudah lama agar hemat token (ala Claude Code).
+
+    Tool result dalam N pesan terakhir dipertahankan penuh; yang lebih lama
+    diganti ringkasan pendek. Hanya untuk payload ke LLM — messages asli
+    tidak diubah (return list baru).
+    """
+    pruned = []
+    cutoff = max(0, len(messages) - keep_last_n)
+    for i, m in enumerate(messages):
+        if m.get("role") == "tool" and i < cutoff:
+            content = str(m.get("content") or "")
+            if len(content) > 300:
+                head = content[:200].replace("\n", " ")
+                summary = (
+                    f"[hasil tool diringkas: {len(content)} char → hemat konteks. "
+                    f"Awal: {head}...]"
+                )
+                m = {**m, "content": summary}
+        pruned.append(m)
+    return pruned
+
+
 def compress_messages(messages, max_messages=MAX_CONTEXT_MESSAGES, cfg=None,
                       max_tokens=8000, strategy="smart"):
     """Kompresi pesan untuk hemat token dengan smart context management.
@@ -3032,14 +3055,16 @@ def chat_loop(cfg):
 
             # Kompresi pesan untuk hemat token (smart context & prompt caching)
             token_est = count_tokens_approx(str(messages))
-            if len(messages) > MAX_CONTEXT_MESSAGES or token_est > 8000:
-                compressed = compress_messages(messages, cfg=cfg)
+            if len(messages) > MAX_CONTEXT_MESSAGES or token_est > 5000:
+                compressed = compress_messages(messages, cfg=cfg, max_tokens=5000)
                 # Tampilkan info kompresi
                 old_count = len(messages)
                 new_count = len(compressed)
                 saved = old_count - new_count
                 tui.add_info(f"Context compressed: {old_count} → {new_count} messages (~{token_est} tokens, saved {saved})")
             else:
+                # Selalu prune hasil tool lama walau belum perlu kompresi penuh
+                compressed = prune_old_tool_results(messages)
                 compressed = messages
 
             # Loop tool-calling: LLM bisa memanggil beberapa tool sebelum menjawab.
@@ -3158,10 +3183,10 @@ def chat_loop(cfg):
 
                     # Kompresi lagi jika perlu, atau sinkronkan compressed dengan messages
                     token_est = count_tokens_approx(str(messages))
-                    if len(messages) > MAX_CONTEXT_MESSAGES or token_est > 8000:
-                        compressed = compress_messages(messages, cfg=cfg)
+                    if len(messages) > MAX_CONTEXT_MESSAGES or token_est > 5000:
+                        compressed = compress_messages(messages, cfg=cfg, max_tokens=5000)
                     else:
-                        compressed = messages
+                        compressed = prune_old_tool_results(messages)
 
                     continue  # kirim hasil tool kembali ke LLM
 
