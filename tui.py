@@ -398,6 +398,12 @@ class ResponsiveTUI:
             def handle_resize(signum, frame):
                 old_width, old_height = self.width, self.height
                 self._update_dimensions()
+                w1, h1 = self.width, self.height
+                # Baca ulang untuk pastikan stabil (hindari flaky winsize)
+                self._update_dimensions()
+                if (self.width, self.height) != (w1, h1):
+                    self.width, self.height = old_width, old_height
+                    return
                 if self.width != old_width or self.height != old_height:
                     self._on_resize()
 
@@ -1159,6 +1165,12 @@ class ClaudeStyleTUI:
             def handle_resize(signum, frame):
                 old_width, old_height = self.width, self.height
                 self._update_dimensions()
+                w1, h1 = self.width, self.height
+                # Baca ulang untuk pastikan stabil (hindari flaky winsize)
+                self._update_dimensions()
+                if (self.width, self.height) != (w1, h1):
+                    self.width, self.height = old_width, old_height
+                    return
                 if self.width != old_width or self.height != old_height:
                     self._on_resize()
             signal.signal(signal.SIGWINCH, handle_resize)
@@ -2275,7 +2287,11 @@ class ClaudeStyleTUI:
         Menampilkan rekomendasi slash command secara real-time saat user
         mengetik diawali '/'. Mendukung Windows (msvcrt) dan Unix (termios).
         """
-        self._check_resize()
+        # _check_resize hanya untuk Windows (tanpa SIGWINCH). Di Unix,
+        # resize ditangani via SIGWINCH; polling di sini berisiko memakai
+        # hasil baca ukuran yang flaky sehingga input_row ngaco.
+        if _IS_WINDOWS:
+            self._check_resize()
 
         if _IS_WINDOWS:
             return self._input_windows()
